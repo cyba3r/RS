@@ -39,6 +39,7 @@ int option_verbose = 0,  // ausfuehrliche Anzeige
     option_b = 0,
     option_color = 0,
     option_rawbits = 0,
+    option_csv = 0,
     wavloaded = 0;
 
 
@@ -596,7 +597,7 @@ int get_SN() {
     unsigned byte;
     ui8_t sn_bytes[5];
 
-    for (i = 0; i < 11; i++) datum.SN[i] = ' '; datum.SN[11] = '\0';
+    for (i = 0; i < 9; i++) datum.SN[i] = ' '; datum.SN[9] = '\0';
 
     for (i = 0; i < 5; i++) {
         byte = frame_bytes[pos_SN + i];
@@ -606,7 +607,7 @@ int get_SN() {
     byte = sn_bytes[2];
     sprintf(datum.SN, "%1X%02u", (byte>>4)&0xF, byte&0xF);
     byte = sn_bytes[3] | (sn_bytes[4]<<8);
-    sprintf(datum.SN+3, " %1X %1u%04u", sn_bytes[0]&0xF, (byte>>13)&0x7, byte&0x1FFF);
+    sprintf(datum.SN+3, "%1X%1u%04u", sn_bytes[0]&0xF, (byte>>13)&0x7, byte&0x1FFF);
 
     return 0;
 }
@@ -714,6 +715,18 @@ int print_pos(int csOK) {
                 }
             }
             printf(ANSI_COLOR_RESET"");
+        }
+        else if (option_csv) {
+            printf("0,");
+            err |= get_SN();
+            printf("%s,", datum.SN);
+            printf("%04d-%02d-%02d,%02d:%02d:%02d,", datum.jahr, datum.monat, datum.tag, datum.std, datum.min, datum.sek);
+            printf("%.5f,", datum.lat);
+            printf("%.5f,", datum.lon);
+            printf("%.2f,", datum.alt);
+            err |= get_GPSvel();
+            printf("%4.1f,%5.1f,%3.1f,", datum.vH, datum.vD, datum.vV);
+            printf(csOK ? "OK" : "FAIL");
         }
         else {
             printf(" (W %d) ", datum.week);
@@ -836,6 +849,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       -r, --raw\n");
             fprintf(stderr, "       -c, --color\n");
             //fprintf(stderr, "       -o, --offset\n");
+            fprintf(stderr, "       --csv\n");
             return 0;
         }
         else if ( (strcmp(*argv, "-v") == 0) || (strcmp(*argv, "--verbose") == 0) ) {
@@ -860,6 +874,7 @@ int main(int argc, char **argv) {
         else if ( (strcmp(*argv, "--rawbits") == 0) ) {
             option_rawbits = 1;
         }
+        else if   (strcmp(*argv, "--csv") == 0) { option_csv = 1; }
         else {
             fp = fopen(*argv, "rb");
             if (fp == NULL) {
