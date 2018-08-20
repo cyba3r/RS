@@ -54,6 +54,7 @@ int option_verbose = 0,  // ausfuehrliche Anzeige
     option_avg = 0,      // moving average
     option_b = 0,
     option_ecc = 0,
+    option_csv = 0,
     wavloaded = 0;
 
 int start = 0;
@@ -626,6 +627,32 @@ void print_gpx() {
                for (j = 0; j < 13; j++) dat_str[i][j] = ' ';
            }
       }
+      else if (option_csv) {
+          printf("%5d,", gpx.frnr);
+          if (gpx.sonde_typ & SNbit) {
+              if ((gpx.sonde_typ & 0xFF) == 6) {
+                  printf("%06X,", gpx.SN6);
+              }
+              else if ((gpx.sonde_typ & 0xFF) == 9) {
+                  printf("%06d,", gpx.SN9);
+              }
+              //gpx.sonde_typ ^= SNbit;
+          }
+          else
+             printf("000000,"); // No SN
+          printf("%04d-%02d-%02d,%02d:%02d:%02d,",
+             gpx.jahr, gpx.monat, gpx.tag,
+             gpx.std, gpx.min, ((int)gpx.sek)%60);
+          printf("%.5f,", gpx.lat);
+          printf("%.5f,", gpx.lon);
+          printf("%.2f,", gpx.alt);
+          printf("%.1f,", gpx.horiV);
+          printf("%.1f,", gpx.dir);
+          printf("%.1f,", gpx.vertV);
+
+          // TODO Check CRC
+          printf("OK");
+      }
       else {
           if (option_auto && option_verbose) printf("[%c] ", option_inv?'-':'+');
           printf("[%3d] ", gpx.frnr);
@@ -758,6 +785,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       -r, --raw\n");
             fprintf(stderr, "       -i, --invert\n");
             fprintf(stderr, "       --ecc        (Hamming ECC)\n");
+            fprintf(stderr, "       --csv        (CSV format)\n");
             fprintf(stderr, "       --avg        (moving average)\n");
             fprintf(stderr, "       -b           (alt. Demod.)\n");
             return 0;
@@ -788,6 +816,9 @@ int main(int argc, char **argv) {
         else if   (strcmp(*argv, "-b3") == 0) { option_b = 3; }
         else if ( (strcmp(*argv, "--ecc") == 0) ) {
             option_ecc = 1;
+        }
+        else if ( (strcmp(*argv, "--csv") == 0) ) {
+            option_csv = 1;
         }
         else {
             fp = fopen(*argv, "rb");
