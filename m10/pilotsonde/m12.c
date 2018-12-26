@@ -39,6 +39,7 @@ int option_verbose = 0,  // ausfuehrliche Anzeige
     option_dc = 0,       // non-constant bias
     option_res = 0,      // genauere Bitmessung
     option_b = 0,
+    option_csv = 0,
     wavloaded = 0;
 
 
@@ -503,6 +504,7 @@ unsigned int crc16rev(unsigned char bytes[], int len) {
 int print_pos() {
     int err;
     unsigned int crc = 0x0000;
+    unsigned int crccalc = 0x0000;
 
     err = 0;
     err |= get_GPSpos();
@@ -511,28 +513,43 @@ int print_pos() {
     err |= get_GPSdate();
 
     if (!err) {
-        //fprintf(stdout, " (%06d)", datum.date);
-        fprintf(stdout, " %02d-%02d-%02d", datum.date/10000, (datum.date%10000)/100, datum.date%100);
-        //fprintf(stdout, " (%09d)", datum.time);
-        fprintf(stdout, " %02d:%02d:%06.3f ", datum.time/10000000, (datum.time%10000000)/100000, (datum.time%100000)/1000.0);
-
-        fprintf(stdout, " lat: %.6f° ", datum.lat/1e6);
-        fprintf(stdout, " lon: %.6f° ", datum.lon/1e6);
-        fprintf(stdout, " alt: %.2fm ", datum.alt/1e2);
-
-        //fprintf(stdout, "  (%.1f , %.1f , %.1f) ", datum.vE/1e2, datum.vN/1e2, datum.vU/1e2);
-        fprintf(stdout, "  vH: %.1fm/s  D: %.1f°  vV: %.1fm/s", datum.vH, datum.vD, datum.vV);
-
-        if (option_verbose) {
-            get_GPSstatus();
-            fprintf(stdout, "  sats: %d  fix: %d ", datum.sats, datum.fix);
-        }
-
         crc = (frame_bytes[FRAME_LEN-2]<<8) | frame_bytes[FRAME_LEN-1];
-        fprintf(stdout, "  # CRC ");
-        if (crc == crc16rev(frame_bytes, FRAME_LEN-2)) fprintf(stdout, "[OK]"); else fprintf(stdout, "[NO]");
+        crccalc = crc16rev(frame_bytes, FRAME_LEN-2);
+
+        if (option_csv) {
+            fprintf(stdout, "%5d,", 0); /* frame number */
+            fprintf(stdout, "%s,", "0"); /* serial number */
+            fprintf(stdout, "20%0d-%02d-%02d,", datum.date%100, (datum.date%10000)/100, datum.date/10000);
+            fprintf(stdout, "%02d:%02d:%02d,", datum.time/10000000, (datum.time%10000000)/100000, (datum.time%100000)/1000);
+            fprintf(stdout, "%.5f,", datum.lat/1e6);
+            fprintf(stdout, "%.5f,", datum.lon/1e6);
+            fprintf(stdout, "%.2f,", datum.alt/1e2);
+            fprintf(stdout, "%.1f,%.1f,%.1f,", datum.vH, datum.vD, datum.vV);
+            fprintf(stdout, crc == crccalc ? "OK" : "FAIL");
+        }
+        else {
+            //fprintf(stdout, " (%06d)", datum.date);
+            fprintf(stdout, " %02d-%02d-%02d", datum.date/10000, (datum.date%10000)/100, datum.date%100);
+            //fprintf(stdout, " (%09d)", datum.time);
+            fprintf(stdout, " %02d:%02d:%06.3f ", datum.time/10000000, (datum.time%10000000)/100000, (datum.time%100000)/1000.0);
+
+            fprintf(stdout, " lat: %.6f° ", datum.lat/1e6);
+            fprintf(stdout, " lon: %.6f° ", datum.lon/1e6);
+            fprintf(stdout, " alt: %.2fm ", datum.alt/1e2);
+
+            //fprintf(stdout, "  (%.1f , %.1f , %.1f) ", datum.vE/1e2, datum.vN/1e2, datum.vU/1e2);
+            fprintf(stdout, "  vH: %.1fm/s  D: %.1f°  vV: %.1fm/s", datum.vH, datum.vD, datum.vV);
+
+            if (option_verbose) {
+                get_GPSstatus();
+                fprintf(stdout, "  sats: %d  fix: %d ", datum.sats, datum.fix);
+            }
+
+            fprintf(stdout, "  # CRC ");
+            if (crc == crccalc) fprintf(stdout, "[OK]"); else fprintf(stdout, "[NO]");
+        }
+        fprintf(stdout, "\n");
     }
-    fprintf(stdout, "\n");
 
     return err;
 }
@@ -579,8 +596,8 @@ int main(int argc, char **argv) {
 
 #ifdef WIN
     _setmode(fileno(stdin), _O_BINARY);  // _setmode(_fileno(stdin), _O_BINARY);
-    setbuf(stdout, NULL);
 #endif
+    setbuf(stdout, NULL);
 
     fpname = argv[0];
     ++argv;
@@ -591,6 +608,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "       -v, --verbose\n");
             fprintf(stderr, "       -r, --raw; -R\n");
             fprintf(stderr, "       -i, --invert; --auto\n");
+            fprintf(stderr, "       --csv\n");
             return 0;
         }
         else if ( (strcmp(*argv, "-v") == 0) || (strcmp(*argv, "--verbose") == 0) ) {
@@ -611,6 +629,7 @@ int main(int argc, char **argv) {
         }
         else if   (strcmp(*argv, "--res") == 0) { option_res = 1; }
         else if   (strcmp(*argv, "-b") == 0) { option_b = 1; }
+        else if   (strcmp(*argv, "--csv") == 0) { option_csv = 1; }
         else {
             fp = fopen(*argv, "rb");
             if (fp == NULL) {
