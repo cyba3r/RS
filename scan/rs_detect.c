@@ -1,7 +1,10 @@
 
 /*
  *  detect/identify radiosondes
- *  DFM, RS92-SGP, RS41, M10, iMet-1-AB
+ *  DFM, RS92-SGP, RS41, M10, M12, iMet-1-AB
+ *
+ * gcc -o rs_detect rs_detect.c -lm
+ *
  */
 
 #include <stdio.h>
@@ -32,6 +35,7 @@ int wavloaded = 0,
 #define  RS92  4
 #define  M10   5
 #define  iMet  6
+#define  M12   7
 
 
 #define HEADLEN 32
@@ -51,6 +55,9 @@ char rs92_header[] = "10100110011001101001"
 
 //int  m10_baudrate = 9600;
 char m10_header[] = "00110011001100110101100110110011";
+
+//int  m12_baudrate = 4800;
+char m12_header[] = "001010101100101010110010101011";
 
 //int  imet_baudrate = 9600;
 char imet_header[] = "11110000111100001111000011110000"
@@ -198,28 +205,28 @@ void inc_buf(int *bufpos) {
   *bufpos = (*bufpos+1) % HEADLEN;
 }
 
-int compare(char buf[], char header[], int bufpos) {
+int compare(char buf[], char header[], int bufpos, int headlen) {
     int i, j;
     
     i = 0;
     j = bufpos;
-    while (i < HEADLEN) {
-        if (j < 0) j = HEADLEN-1;
-        if (buf[j] != header[HEADOFS+HEADLEN-1-i]) break;
+    while (i < headlen) {
+        if (j < 0) j = headlen-1;
+        if (buf[j] != header[HEADOFS+headlen-1-i]) break;
         j--;
         i++;
     }
-    if (i == HEADLEN) return 1;
+    if (i == headlen) return 1;
 
     i = 0;
     j = bufpos;
-    while (i < HEADLEN) {
-        if (j < 0) j = HEADLEN-1;
-        if (buf[j] != inv(header[HEADOFS+HEADLEN-1-i])) break;
+    while (i < headlen) {
+        if (j < 0) j = headlen-1;
+        if (buf[j] != inv(header[HEADOFS+headlen-1-i])) break;
         j--;
         i++;
     }
-    if (i == HEADLEN) return -1;
+    if (i == headlen) return -1;
 
     return 0;
 }
@@ -289,25 +296,27 @@ int main(int argc, char **argv) {
         for (i = 0; i < len25; i++) {
             inc_buf(&bufpos25);
             buf25[bufpos25] = 0x30 + bit;  // Ascii
-            header_found = compare(buf25, dfm_header, bufpos25) * DFM;
+            header_found = compare(buf25, dfm_header, bufpos25, HEADLEN) * DFM;
             if (header_found) goto ende;
         }
 
         for (i = 0; i < len48; i++) {
             inc_buf(&bufpos48);
             buf48[bufpos48] = 0x30 + bit;  // Ascii
-            header_found = compare(buf48, rs41_header+16, bufpos48) * RS41;
+            header_found = compare(buf48, rs41_header+16, bufpos48, HEADLEN) * RS41;
             if (header_found) goto ende;
-            header_found = compare(buf48, rs92_header, bufpos48) * RS92;
+            header_found = compare(buf48, rs92_header, bufpos48, HEADLEN) * RS92;
+            if (header_found) goto ende;
+            header_found = compare(buf48, m12_header, bufpos48, HEADLEN-2) * M12;
             if (header_found) goto ende;
         }
 
         for (i = 0; i < len96; i++) {
             inc_buf(&bufpos96);
             buf96[bufpos96] = 0x30 + bit;  // Ascii
-            header_found = compare(buf96, m10_header, bufpos96) * M10;
+            header_found = compare(buf96, m10_header, bufpos96, HEADLEN) * M10;
             if (header_found) goto ende;
-            header_found = compare(buf96, imet_header+32, bufpos96) * iMet;
+            header_found = compare(buf96, imet_header+32, bufpos96, HEADLEN) * iMet;
             if (header_found) goto ende;
         }
 
@@ -332,6 +341,7 @@ ende:
             if (header_found*header_found == RS92*RS92) printf("RS92");
             if (header_found*header_found == M10*M10)   printf("M10");
             if (header_found*header_found == iMet*iMet) printf("iMet");
+            if (header_found*header_found == M12*M12)   printf("M12");
             if (option_gmt) {
                 printf(" (%4d-%02d-%02d %02d:%02dZ) ", gmt->tm_year+1900, gmt->tm_mon,
                                                        gmt->tm_mday, gmt->tm_hour, gmt->tm_min);
