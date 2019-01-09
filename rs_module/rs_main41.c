@@ -16,7 +16,7 @@ int option_verbose = 0,  // ausfuehrliche Anzeige
     option_inv = 0,      // invertiert Signal
     option_crc = 0,      // check CRC
     option_sat = 0,      // GPS sat data
-    wavloaded = 0;
+    wavloaded = 0,
     option_csv = 0; 
 
 
@@ -201,7 +201,8 @@ int main(int argc, char *argv[]) {
             rs_data->buf[rs_data->bufpos] = 0x30 + bit;  // Ascii
 
             if (!header_found) {
-                if (compare(rs_data) >= rs_data->header_len) header_found = 1;
+                header_found = compare(rs_data);
+                if (header_found < 0) option_inv ^= 0x1;
             }
             else {
 

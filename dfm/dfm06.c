@@ -50,7 +50,6 @@ char dat_str[9][13+1];
 int option_verbose = 0,  // ausfuehrliche Anzeige
     option_raw = 0,      // rohe Frames
     option_inv = 0,      // invertiert Signal
-    option_auto = 0,
     option_avg = 0,      // moving average
     option_b = 0,
     option_ecc = 0,
@@ -357,7 +356,6 @@ int compare2() {
     }
     if (i == HEADLEN) return 1;
 
-    if (option_auto) {
     i = 0;
     j = bufpos;
     while (i < HEADLEN) {
@@ -367,7 +365,6 @@ int compare2() {
         i++;
     }
     if (i == HEADLEN) return -1;
-    }
 
     return 0;
 
@@ -654,7 +651,6 @@ void print_gpx() {
           printf("OK");
       }
       else {
-          if (option_auto && option_verbose) printf("[%c] ", option_inv?'-':'+');
           printf("[%3d] ", gpx.frnr);
           printf("%4d-%02d-%02d ", gpx.jahr, gpx.monat, gpx.tag);
           printf("%02d:%02d:%04.1f ", gpx.std, gpx.min, gpx.sek);
@@ -804,9 +800,6 @@ int main(int argc, char **argv) {
         }
         else if ( (strcmp(*argv, "-i") == 0) || (strcmp(*argv, "--invert") == 0) ) {
             option_inv = 0x1;
-        }
-        else if ( (strcmp(*argv, "--auto") == 0) ) {
-            option_auto = 1;
         }
         else if ( (strcmp(*argv, "--avg") == 0) ) {
             option_avg = 1;

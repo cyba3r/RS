@@ -35,7 +35,6 @@ datum_t datum;
 int option_verbose = 0,  // ausfuehrliche Anzeige
     option_raw = 0,      // rohe Frames
     option_inv = 0,      // invertiert Signal
-    option_auto = 0,
     option_dc = 0,       // non-constant bias
     option_res = 0,      // genauere Bitmessung
     option_b = 0,
@@ -328,7 +327,6 @@ int compare2() {
     }
     if (i == HEADLEN) return 1;
 
-    if (option_auto) {
     i = 0;
     j = bufpos;
     while (i < HEADLEN) {
@@ -338,7 +336,6 @@ int compare2() {
         i++;
     }
     if (i == HEADLEN) return -1;
-    }
 
     return 0;
 }
@@ -606,8 +603,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "%s [options] audio.wav\n", fpname);
             fprintf(stderr, "  options:\n");
             fprintf(stderr, "       -v, --verbose\n");
-            fprintf(stderr, "       -r, --raw; -R\n");
-            fprintf(stderr, "       -i, --invert; --auto\n");
+            fprintf(stderr, "       -i, --invert\n");
+            fprintf(stderr, "       -r, --raw\n");
+            fprintf(stderr, "       -R\n");
             fprintf(stderr, "       --csv\n");
             return 0;
         }
@@ -620,9 +618,6 @@ int main(int argc, char **argv) {
         else if ( (strcmp(*argv, "-R") == 0) ) option_raw = 2;
         else if ( (strcmp(*argv, "-i") == 0) || (strcmp(*argv, "--invert") == 0) ) {
             option_inv = 1;
-        }
-        else if ( (strcmp(*argv, "--auto") == 0) ) {
-            option_auto = 1;
         }
         else if ( (strcmp(*argv, "--dc") == 0) ) {
             option_dc = 1;
@@ -682,9 +677,7 @@ int main(int argc, char **argv) {
 
             if (!header_found) {
                 header_found = compare2();
-                //if (header_found) fprintf(stdout, "[%c] ", header_found>0?'+':'-');
                 if (header_found < 0) option_inv ^= 0x1;
-                // printf("[%c] ", option_inv?'-':'+');
             }
             else {
                 frame_bits[pos] = 0x30 + bit;  // Ascii

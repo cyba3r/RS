@@ -845,10 +845,10 @@ int main(int argc, char **argv) {
         if      ( (strcmp(*argv, "-h") == 0) || (strcmp(*argv, "--help") == 0) ) {
             fprintf(stderr, "%s [options] audio.wav\n", fpname);
             fprintf(stderr, "  options:\n");
-            //fprintf(stderr, "       -v, --verbose\n");
+            fprintf(stderr, "       -v, --verbose\n");
             fprintf(stderr, "       -r, --raw\n");
             fprintf(stderr, "       -c, --color\n");
-            //fprintf(stderr, "       -o, --offset\n");
+            fprintf(stderr, "       -i, --invert\n");
             fprintf(stderr, "       --csv\n");
             return 0;
         }
@@ -918,6 +918,7 @@ int main(int argc, char **argv) {
 
             if (!header_found) {
                 header_found = compare2();
+                if (header_found < 0) option_inv ^= 0x1;
             }
             else {
                 frame_rawbits[pos] = 0x30 + bit;  // Ascii
