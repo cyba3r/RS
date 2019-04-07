@@ -1,24 +1,37 @@
 
 /*
- *  rs41
- *  sync header: correlation/matched filter
- *  files: rs41dm_dft.c bch_ecc.c demod_dft.h demod_dft.c
- *  compile:
- *      gcc -c demod_dft.c
- *      gcc rs41dm_dft.c demod_dft.o -lm -o rs41dm_dft
+ * radiosondes RS41-SG(P)
+ * author: zilog80
  *
- *  author: zilog80
+ * compile:
+ *     gcc rs41iq.c -lm -o rs41iq
+ *     (includes bch_ecc.c)
+ * usage:
+ *     ./rs41iq [options] audio.wav
+ *       options:
+ *            -v, -vx, -vv  (info, aux, info/conf)
+ *            -r, --raw
+ *            -i, --invert
+ *            -b           (alt. Demod.)
+ *            --crc        (check CRC)
+ *            --ecc2       (Reed-Solomon)
+ *            --ptu        (temperature)
+ *            --iq
+ *            --iq2==--iq3
  */
+
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <complex.h>
 
 #ifdef CYGWIN
   #include <fcntl.h>  // cygwin: _setmode()
   #include <io.h>
 #endif
+
 
 typedef unsigned char  ui8_t;
 typedef unsigned short ui16_t;
@@ -26,8 +39,6 @@ typedef unsigned int   ui32_t;
 typedef short i16_t;
 typedef int   i32_t;
 
-//#include "demod_dft.c"
-#include "demod_dft.h"
 
 #include "bch_ecc.c"  // RS/ecc/
 
@@ -47,7 +58,6 @@ rscfg_t cfg_rs41 = { 41, (320-56)/2, 56, 8, 8, 320};
 typedef struct {
     int frnr;
     char id[9];
-    ui8_t numSV;
     int week; int gpssec;
     int jahr; int monat; int tag;
     int wday;
@@ -55,7 +65,7 @@ typedef struct {
     double lat; double lon; double alt;
     double vN; double vE; double vU;
     double vH; double vD; double vD2;
-    float T; float RH;
+    float T;
     ui32_t crc;
 } gpx_t;
 
@@ -66,22 +76,26 @@ int option_verbose = 0,  // ausfuehrliche Anzeige
     option_inv = 0,      // invertiert Signal
     option_res = 0,      // genauere Bitmessung
     option_crc = 0,      // check CRC
+    option_avg = 0,      // moving average
+    option_b = 0,
     option_ecc = 0,      // Reed-Solomon ECC
     option_sat = 0,      // GPS sat data
     option_ptu = 0,
-    option_ths = 0,
-    option_json = 0,     // JSON output (auto_rx)
+    option_len = 0,
+    option_iq = 0,
     wavloaded = 0;
 int wav_channel = 0;     // audio channel: left
+int rawin = 0;
 
 
-#define BITS    8
-#define HEADLEN 64
-#define FRAMESTART ((HEADLEN)/BITS)
+#define HEADOFS 24 // HEADOFS+HEADLEN <= 64
+#define HEADLEN 32 // HEADOFS+HEADLEN mod 8 = 0
+#define FRAMESTART ((HEADOFS+HEADLEN)/8)
 
 /*               10      B6      CA      11      22      96      12      F8      */
 char header[] = "0000100001101101010100111000100001000100011010010100100000011111";
-
+char buf[HEADLEN+1] = "x";
+int bufpos = -1;
 
 #define NDATA_LEN 320                    // std framelen 320
 #define XDATA_LEN 198
@@ -89,7 +103,8 @@ char header[] = "000010000110110101010011100010000100010001101001010010000001111
 ui8_t //xframe[FRAME_LEN] = { 0x10, 0xB6, 0xCA, 0x11, 0x22, 0x96, 0x12, 0xF8},    = xorbyte( frame)
          frame[FRAME_LEN] = { 0x86, 0x35, 0xf4, 0x40, 0x93, 0xdf, 0x1a, 0x60}; // = xorbyte(xframe)
 
-float byteQ[FRAME_LEN];
+char buffer_rawin[3*FRAME_LEN+12]; //## rawin1: buffer_rawin[2*FRAME_LEN+12];
+int frameofs = 0;
 
 #define MASK_LEN 64
 ui8_t mask[MASK_LEN] = { 0x96, 0x83, 0x3E, 0x51, 0xB1, 0x49, 0x08, 0x98,
@@ -106,9 +121,447 @@ ui8_t mask[MASK_LEN] = { 0x96, 0x83, 0x3E, 0x51, 0xB1, 0x49, 0x08, 0x98,
  * F776827F0799A22C937C3063F5102E61D0BCB4B606AAF423786E3BAEBF7B4CC196833E51B1490898
  */
 
+
 /* ------------------------------------------------------------------------------------ */
 
+int LOG2N;
+int N_DFT, M_DFT;
+int N_IQBUF;
+double complex *raw_iqbuf = NULL;
+double complex *rot_iqbuf = NULL;
+
+
+int Nvar = 0;
+float *bufvar = NULL;
+float xsum = 0,
+      qsum = 0;
+float mu, bvar[FRAME_LEN];
+
+/* ------------------------------------------------------------------------------------ */
+
+// option_b: exakte Baudrate wichtig!
+// im Prinzip in sync-preamble/header ermittelbar
 #define BAUD_RATE 4800
+
+int sample_rate = 0, bits_sample = 0, channels = 0;
+float samples_per_bit = 0;
+
+int findstr(char *buff, char *str, int pos) {
+    int i;
+    for (i = 0; i < 4; i++) {
+        if (buff[(pos+i)%4] != str[i]) break;
+    }
+    return i;
+}
+
+int read_wav_header(FILE *fp) {
+    char txt[4+1] = "\0\0\0\0";
+    unsigned char dat[4];
+    int byte, p=0;
+
+    if (fread(txt, 1, 4, fp) < 4) return -1;
+    if (strncmp(txt, "RIFF", 4)) return -1;
+    if (fread(txt, 1, 4, fp) < 4) return -1;
+    // pos_WAVE = 8L
+    if (fread(txt, 1, 4, fp) < 4) return -1;
+    if (strncmp(txt, "WAVE", 4)) return -1;
+    // pos_fmt = 12L
+    for ( ; ; ) {
+        if ( (byte=fgetc(fp)) == EOF ) return -1;
+        txt[p % 4] = byte;
+        p++; if (p==4) p=0;
+        if (findstr(txt, "fmt ", p) == 4) break;
+    }
+    if (fread(dat, 1, 4, fp) < 4) return -1;
+    if (fread(dat, 1, 2, fp) < 2) return -1;
+
+    if (fread(dat, 1, 2, fp) < 2) return -1;
+    channels = dat[0] + (dat[1] << 8);
+
+    if (fread(dat, 1, 4, fp) < 4) return -1;
+    memcpy(&sample_rate, dat, 4); //sample_rate = dat[0]|(dat[1]<<8)|(dat[2]<<16)|(dat[3]<<24);
+
+    if (fread(dat, 1, 4, fp) < 4) return -1;
+    if (fread(dat, 1, 2, fp) < 2) return -1;
+    //byte = dat[0] + (dat[1] << 8);
+
+    if (fread(dat, 1, 2, fp) < 2) return -1;
+    bits_sample = dat[0] + (dat[1] << 8);
+
+    // pos_dat = 36L + info
+    for ( ; ; ) {
+        if ( (byte=fgetc(fp)) == EOF ) return -1;
+        txt[p % 4] = byte;
+        p++; if (p==4) p=0;
+        if (findstr(txt, "data", p) == 4) break;
+    }
+    if (fread(dat, 1, 4, fp) < 4) return -1;
+
+
+    fprintf(stderr, "sample_rate: %d\n", sample_rate);
+    fprintf(stderr, "bits       : %d\n", bits_sample);
+    fprintf(stderr, "channels   : %d\n", channels);
+
+    if ((bits_sample != 8) && (bits_sample != 16)) return -1;
+
+    samples_per_bit = sample_rate/(float)BAUD_RATE;
+
+    fprintf(stderr, "samples/bit: %.2f\n", samples_per_bit);
+
+    return 0;
+}
+
+
+#define EOF_INT  0x1000000
+
+#define LEN_movAvg 3
+int movAvg[LEN_movAvg];
+unsigned long sample_count = 0;
+
+int read_sample(FILE *fp, double *x) {  // channels == 1
+    int i;
+    short b = 0;
+
+    for (i = 0; i < channels; i++) {
+                           // i = 0: links bzw. mono
+        if (fread( &b, bits_sample/8, 1, fp) != 1) return EOF;
+
+        if (i == wav_channel) {
+            if (bits_sample ==  8) { b -= 128; }
+            *x = b/128.0;
+            if (bits_sample == 16) { *x /= 256.0; }
+        }
+    }
+
+    return 0;
+}
+
+int read_csample(FILE *fp, double complex *z) {
+    short x = 0, y = 0;
+
+    if (fread( &x, bits_sample/8, 1, fp) != 1) return EOF;
+    if (fread( &y, bits_sample/8, 1, fp) != 1) return EOF;
+
+    *z = x + I*y;
+
+    if (bits_sample ==  8) { *z -= 128 + I*128; }
+    *z /= 128.0;
+    if (bits_sample == 16) { *z /= 256.0; }
+
+    return 0;
+}
+
+int sample_head_start = 0;
+int sample_framestart = 0;
+int sample_posnoise = 0;
+double df = 0.0;
+
+int len_sq = 0;
+double V_noise = 0.0;
+double V_signal = 0.0;
+double SNRdB = 0.0;
+
+int read_signed_sample(FILE *fp, double *s) {  // int = i32_t
+    double x=0, x0=0;
+    double complex z, w;
+    static double complex z0;
+    double gain = 1.0;
+
+    if (option_iq) {
+
+        if ( read_csample(fp, &z) == EOF ) return EOF;
+        raw_iqbuf[sample_count % N_IQBUF] = z;
+        double t = (double)(sample_count) / sample_rate;
+
+        z *= cexp(-t*2*M_PI*df*I);
+        w = z * conj(z0);
+        x = gain * carg(w)/M_PI; // d1
+        //x = _gain * cimag(w) / (cabs(z0)*cabs(z0)); // for small angles ... d2
+        z0 = z;
+        rot_iqbuf[sample_count % N_IQBUF] = z;
+
+        if (sample_posnoise > 0)
+        {
+            if (sample_count >= sample_framestart && sample_count < sample_framestart+len_sq) {
+                if (sample_count == sample_framestart) V_signal = 0.0;
+                V_signal += cabs(z);
+            }
+            if (sample_count == sample_framestart+len_sq) V_signal /= (double)len_sq;
+
+            if (sample_count >= sample_posnoise && sample_count < sample_posnoise+len_sq) {
+                if (sample_count == sample_posnoise) V_noise = 0.0;
+                V_noise += cabs(z);
+            }
+            if (sample_count == sample_posnoise+len_sq) {
+                V_noise = V_noise/(double)len_sq;
+#if defined(DBG) || defined(DBG1)
+                if (V_signal > 0 && V_noise > 0) {
+                    // iq-samples/V [-1..1]
+                    // dBw = 2*dBv, P=c*U*U
+                    // dBw = 2*10*log10(V/V0)
+                    SNRdB = 20.0 * log10(V_signal/V_noise+1e-20);
+                    fprintf(stderr, "SNR: %.2f dB\n", SNRdB);
+                }
+#endif
+            }
+        }
+
+#ifdef DBG1
+        if ( sample_framestart > 0 && sample_count >= (unsigned long)sample_framestart &&
+            ((int)(sample_count-sample_framestart) % (int)(samples_per_bit*8.0) == 0) ) {
+            double phase = carg(z);   // ignore ISI ...
+            fprintf(stderr, "%lu  phase  : %+.2f\n", sample_count, phase/M_PI);
+        }
+#endif
+
+    }
+    else {
+        if ( read_sample(fp, &x) == EOF ) return EOF;
+    }
+    *s = x;
+
+    if (option_b)
+    {
+        bufvar[sample_count % Nvar] = x;
+        x0 = bufvar[(sample_count+1) % Nvar];
+        xsum = xsum - x0 + x;
+        qsum = qsum - x0*x0 + x*x;
+    }
+
+
+    sample_count++;
+
+    return 0;
+}
+
+int par=1, par_alt=1;
+
+int read_bits_fsk(FILE *fp, int *bit, int *len) {
+    static double sample;
+    float l;
+    int n;
+
+    n = 0;
+    do{
+        if ( read_signed_sample(fp, &sample) == EOF ) return EOF;
+        par_alt = par;
+        par =  (sample >= 0) ? 1 : -1;  // 8bit: 0..127,128..255 (-128..-1,0..127)
+        n++;
+    } while (par*par_alt > 0);
+
+    l = (float)n / samples_per_bit;
+
+    *len = (int)(l+0.5);
+
+    if (!option_inv) *bit = (1+par_alt)/2;  // oben 1, unten -1
+    else             *bit = (1-par_alt)/2;  // sdr#<rev1381?, invers: unten 1, oben -1
+
+    /* Y-offset ? */
+
+    return 0;
+}
+
+int bitstart = 0;
+double bitgrenze = 0;
+unsigned long scount = 0;
+int read_rawbit(FILE *fp, int *bit) {
+    double sample;
+    double sum;
+    double sample0;
+    int pars;
+    int n;
+
+    sum = 0;
+
+    sample0 = 0;
+    pars = 0;
+
+    if (bitstart) {
+        scount = 1;    // (sample_count overflow/wrap-around)
+        bitgrenze = 0; // d.h. bitgrenze = sample_count-1 (?)
+        bitstart = 0;
+    }
+    bitgrenze += samples_per_bit;
+
+    n = 0;
+    do {
+        if ( read_signed_sample(fp, &sample) == EOF ) return EOF;
+        //par =  (sample >= 0) ? 1 : -1;    // 8bit: 0..127,128..255 (-128..-1,0..127)
+        sum += sample;
+
+        if (sample * sample0 < 0) pars++;   // wenn sample[0..n-1]=0 ...
+        sample0 = sample;
+
+        scount++;
+        n++;
+    } while (scount < bitgrenze);  // n < samples_per_bit
+
+    if (sum >= 0) *bit = 1;
+    else          *bit = 0;
+
+    if (option_inv) *bit ^= 1;
+
+
+    if (option_iq >= 2) {
+
+        double h = 1.0; // modulation index, GFSK; h(rs41)=0.8?
+        double complex z = 0;
+        double complex X1 = 0;
+        double complex X2 = 0;
+        int cbit = 0;
+
+        if (option_iq == 2) {
+            double t = 1.0 / sample_rate;
+            double f1 = -h*sample_rate/(2*samples_per_bit);
+            double f2 = -f1;
+            while (n > 0) {
+                t = -n / (double)sample_rate;
+                z = rot_iqbuf[(sample_count-n + N_IQBUF) % N_IQBUF];
+                X1 += z*cexp(-t*2*M_PI*f1*I);
+                X2 += z*cexp(-t*2*M_PI*f2*I);
+                n--;
+            }
+        }
+        else {
+            double complex xi1 = cexp(+I*M_PI*h/samples_per_bit);
+            double complex xi2 = cexp(-I*M_PI*h/samples_per_bit);
+            double complex x1 = xi1;
+            double complex x2 = xi2;
+            while (n > 0) {
+                z = rot_iqbuf[(sample_count-n + N_IQBUF) % N_IQBUF];
+                X1 += z*x1;  x1 *= xi1;
+                X2 += z*x2;  x2 *= xi2;
+                n--;
+            }
+        }
+
+        if (cabs(X1) < cabs(X2)) cbit = 1; else cbit = 0;
+
+#ifdef DBG2
+        fprintf(stderr, "bit: %d  #  X1: %+.4f %+.4fi |  X2: %+.4f %+.4fi", *bit, creal(X1), cimag(X1), creal(X2), cimag(X2));
+        fprintf(stderr, "  #  |X1|: %.4f    |X2|: %.4f", cabs(X1), cabs(X2));
+        fprintf(stderr, "  #  |X2|-|X1|: %+.4f", cabs(X2)-cabs(X1));
+        fprintf(stderr, "  #  [%c]", (cbit == *bit)?'+':'-');
+        fprintf(stderr, "   (%lu)\n", sample_count);
+#endif
+
+        *bit = cbit;
+    }
+
+
+    return pars;
+}
+
+/* ------------------------------------------------------------------------------------ */
+
+
+double complex *xn, *Z, *w, *ew, *ewa;
+double *Hann, *db;
+
+int init_dft() {
+    int i, k, n;
+    int WLEN = M_DFT;
+
+    xn = calloc(N_DFT, sizeof(complex double));  if (xn     == NULL) return -1;
+    Z  = calloc(N_DFT, sizeof(complex double));  if (Z      == NULL) return -1;
+    ew = calloc(LOG2N, sizeof(complex double));  if (ew == NULL) return -1;
+    db = calloc(N_DFT, sizeof(double));  if (db == NULL) return -1;
+
+    Hann = calloc(N_DFT, sizeof(complex double)); if (Hann == NULL) return -1;
+/*
+    for (i = 0; i < N_DFT; i++)  Hann[i] = 0;
+    for (i = 0; i < WLEN;  i++)  Hann[i] = 0.5 * (1 - cos( 2 * M_PI * i / (double)(WLEN-1) ) );
+                               //Hann[i+(N-1-WLEN)/2] = 0.5 * (1 - cos( 2 * M_PI * i / (double)(WLEN-1) ) );
+*/
+    for (i = 0; i < M_DFT; i++)  Hann[i] = 0.5 * (1 - cos( 2 * M_PI * i / (double)(M_DFT-1) ) );
+
+    for (n = 0; n < LOG2N; n++) {
+        k = 1 << n;
+        ew[n] = cexp(-I*M_PI/(double)k);
+    }
+
+    return 0;
+}
+
+int free_dft() {
+
+    if (xn) { free(xn); xn = NULL; }
+    if (Z ) { free(Z ); Z  = NULL; }
+    if (ew) { free(ew); ew = NULL; }
+    if (db) { free(db); db = NULL; }
+
+    if (Hann) { free(Hann); Hann = NULL; }
+
+    return 0;
+}
+
+void dft2() {
+    int s, l, l2, i, j, k;
+    double complex  w1, w2, T;
+
+    for (i = 0; i < N_DFT; i++)  Z[i] = /*(double complex)*/xn[i];
+    //Z = xn;
+
+    j = 1;
+    for (i = 1; i < N_DFT; i++) {
+        if (i < j) {
+            T = Z[j-1];
+            Z[j-1] = Z[i-1];
+            Z[i-1] = T;
+        }
+        k = N_DFT/2;
+        while (k < j) {
+            j = j - k;
+            k = k/2;
+        }
+        j = j + k;
+    }
+
+    for (s = 0; s < LOG2N; s++) {
+        l2 = 1 << s;
+        l  = l2 << 1;
+        w1 = (double complex)1.0;
+        w2 = cexp(-I*M_PI/(double)l2);
+        //w2 = ew[s];
+        for (j = 1; j <= l2; j++) {
+            for (i = j; i <= N_DFT; i += l) {
+                k = i + l2;
+                T = Z[k-1] * w1;
+                Z[k-1] = Z[i-1] - T;
+                Z[i-1] = Z[i-1] + T;
+            }
+            w1 = w1 * w2;
+        }
+    }
+}
+
+void db_power(double complex Z[], double db[]) {
+    int i;
+    for (i = 0; i < N_DFT; i++) {
+        db[i] = 20.0 * log10(cabs(Z[i])/N_DFT+1e-20);
+    }
+}
+
+float bin2freq(int k) {
+    float fq = sample_rate * k / N_DFT;
+    if (fq > sample_rate/2.0) fq -= sample_rate;
+    return fq;
+}
+
+int max_bin() {
+    int k, kmax;
+    double max;
+
+    max = 0; kmax = 0;
+    for (k = 0; k < N_DFT; k++) {
+        if (cabs(Z[k]) > max) {
+            max = cabs(Z[k]);
+            kmax = k;
+        }
+    }
+
+    return kmax;
+}
 
 /* ------------------------------------------------------------------------------------ */
 
@@ -126,6 +579,21 @@ int bits2byte(char bits[]) {
 }
 
 
+void inc_bufpos() {
+  bufpos = (bufpos+1) % HEADLEN;
+}
+
+int compare() {
+    int i=0, j = bufpos;
+
+    while (i < HEADLEN) {
+        if (j < 0) j = HEADLEN-1;
+        if (buf[j] != header[HEADOFS+HEADLEN-1-i]) break;
+        j--;
+        i++;
+    }
+    return i;
+}
 /*
 ui8_t xorbyte(int pos) {
     return  xframe[pos] ^ mask[pos % MASK_LEN];
@@ -289,7 +757,6 @@ int check_CRC(ui32_t pos, ui32_t pck) {
         // weitere chars in calfr 0x22/0x23; weitere ID
 
 #define crc_PTU      (1<<1)
-#define xor_PTU      0xE388  // ^0x99A2=0x0x7A2A
 #define pck_PTU      0x7A2A  // PTU
 #define pos_PTU       0x065
 
@@ -302,7 +769,6 @@ int check_CRC(ui32_t pos, ui32_t pck) {
 #define pos_satsN     0x09B  // 12x2 byte (1: SV, 1: quality,strength)
 
 #define crc_GPS2     (1<<3)
-#define xor_GPS2     0xD7AD  // ^0xAAF4=0x7D59
 #define pck_GPS2     0x7D59  // RXM-RAW (0x02 0x10)
 #define pos_GPS2      0x0B5
 #define pos_minPR     0x0B7  //        4 byte
@@ -327,23 +793,6 @@ int check_CRC(ui32_t pos, ui32_t pck) {
 
 #define crc_ZERO     (1<<6)  // LEN variable
 #define pck_ZERO     0x7600
-#define pck_ZEROstd  0x7611  // NDATA std-frm, no aux
-#define pos_ZEROstd   0x12B  // pos_AUX(0)
-
-
-/*
-  frame[pos_FRAME-1] == 0x0F: len == NDATA_LEN(320)
-  frame[pos_FRAME-1] == 0xF0: len == FRAME_LEN(518)
-*/
-int frametype() { // -4..+4: 0xF0 -> -4 , 0x0F -> +4
-    int i;
-    ui8_t b = frame[pos_FRAME-1];
-    int ft = 0;
-    for (i = 0; i < 4; i++) {
-        ft += ((b>>i)&1) - ((b>>(i+4))&1);
-    }
-    return ft;
-}
 
 
 ui8_t calibytes[51*16];
@@ -354,7 +803,6 @@ float Rf1,      // ref-resistor f1 (750 Ohm)
       calT1[3], // calibration T1
       co2[3],   // { -243.911 , 0.187654 , 8.2e-06 }
       calT2[3]; // calibration T2-Hum
-float calH[2];  // calibration Hum
 
 
 double c = 299.792458e6;
@@ -364,7 +812,7 @@ int get_SatData() {
     int i, n;
     int sv;
     ui32_t minPR;
-    int numSV;
+    int Nfix;
     double pDOP, sAcc;
 
     fprintf(stdout, "[%d]\n", u2(frame+pos_FrameNb));
@@ -396,10 +844,10 @@ int get_SatData() {
                      (i16_t)u2(frame+pos_GPSecefV+2),
                      (i16_t)u2(frame+pos_GPSecefV+4));
 
-    numSV = frame[pos_numSats];
-    sAcc = frame[pos_sAcc]/10.0; if (frame[pos_sAcc] == 0xFF) sAcc = -1.0;
-    pDOP = frame[pos_pDOP]/10.0; if (frame[pos_pDOP] == 0xFF) pDOP = -1.0;
-    fprintf(stdout, "numSatsFix: %2d  sAcc: %.1f  pDOP: %.1f\n", numSV, sAcc, pDOP);
+    Nfix = frame[pos_numSats];
+    sAcc = frame[pos_sAcc]/10.0;
+    pDOP = frame[pos_pDOP]/10.0;
+    fprintf(stdout, "numSatsFix: %2d  sAcc: %.1f  pDOP: %.1f\n", Nfix, sAcc, pDOP);
 
 
     fprintf(stdout, "CRC: ");
@@ -499,9 +947,6 @@ int get_CalData() {
     memcpy(calT1+1, calibytes+93, 4);  // 0x05*0x10+13
     memcpy(calT1+2, calibytes+97, 4);  // 0x06*0x10+ 1
 
-    memcpy(calH+0, calibytes+117, 4);  // 0x07*0x10+ 5
-    memcpy(calH+1, calibytes+121, 4);  // 0x07*0x10+ 9
-
     memcpy(co2+0, calibytes+293, 4);  // 0x12*0x10+ 5
     memcpy(co2+1, calibytes+297, 4);  // 0x12*0x10+ 9
     memcpy(co2+2, calibytes+301, 4);  // 0x12*0x10+13
@@ -513,7 +958,6 @@ int get_CalData() {
     return 0;
 }
 
-/*
 float get_Tc0(ui32_t f, ui32_t f1, ui32_t f2) {
     // y  = (f - f1) / (f2 - f1);
     // y1 = (f - f1) / f2; // = (1 - f1/f2)*y
@@ -531,21 +975,6 @@ float get_Tc0(ui32_t f, ui32_t f1, ui32_t f2) {
     // R/R0 = 1 + at + bt^2 + c(t-100)t^3 , R0 = 1000 Ohm, t/Celsius
     return t;
 }
-*/
-// T_RH-sensor
-float get_TH(ui32_t f, ui32_t f1, ui32_t f2) {
-    float *p = co2;
-    float *c  = calT2;
-    float  g = (float)(f2-f1)/(Rf2-Rf1),       // gain
-          Rb = (f1*Rf2-f2*Rf1)/(float)(f2-f1), // ofs
-          Rc = f/g - Rb,
-          //R = (Rc + c[1]) * c[0],
-          //T = p[0] + p[1]*R + p[2]*R*R;
-          R = Rc * c[0],
-          T = (p[0] + p[1]*R + p[2]*R*R + c[1])*(1.0 + c[2]);
-    return T;
-}
-// T-sensor, platinum resistor
 float get_Tc(ui32_t f, ui32_t f1, ui32_t f2) {
     float *p = co1;
     float *c  = calT1;
@@ -559,40 +988,20 @@ float get_Tc(ui32_t f, ui32_t f1, ui32_t f2) {
     return T;
 }
 
-// rel.hum., capacitor
-// (data:) ftp://ftp-cdc.dwd.de/pub/CDC/observations_germany/radiosondes/
-// (diffAlt: Ellipsoid-Geoid)
-float get_RH(ui32_t f, ui32_t f1, ui32_t f2, float T) {
-    float b0 = calH[0]/46.64; // empirical
-    float b1 = 0.1276;        // empirical
-    float fh = (f-f1)/(float)(f2-f1);
-    float rh = 100.0 * (fh-b0)/b1;
-    float T0 = 0.0, T1 = -30.0; // T/C
-    if (T < T0) rh += T0 - T/5.5;        // empir. temperature compensation
-    if (T < T1) rh *= 1.0 + (T1-T)/75.0; // empir. temperature compensation
-    if (rh < 0.0) rh = 0.0;
-    if (rh > 100.0) rh = 100.0;
-    if (T < -273.0) rh = -1.0;
-    return rh;
-}
-
 int get_PTU() {
     int err=0, i;
     int bR, bc1, bT1,
             bc2, bT2;
-    int bH;
     ui32_t meas[12];
     float Tc = -273.15;
-    float TH = -273.15;
-    float RH = -1.0;
+    float Tc0 = -273.15;
 
     get_CalData();
 
     err = check_CRC(pos_PTU, pck_PTU);
     if (err) gpx.crc |= crc_PTU;
 
-    if (err == 0)
-    {
+    if (err == 0) {
 
         for (i = 0; i < 12; i++) {
             meas[i] = u3(frame+pos_PTU+2+3*i);
@@ -603,25 +1012,14 @@ int get_PTU() {
         bT1 = calfrchk[0x05] && calfrchk[0x06];
         bc2 = calfrchk[0x12] && calfrchk[0x13];
         bT2 = calfrchk[0x13];
-        bH  = calfrchk[0x07];
 
         if (bR && bc1 && bT1) {
             Tc = get_Tc(meas[0], meas[1], meas[2]);
-            //Tc0 = get_Tc0(meas[0], meas[1], meas[2]);
+            Tc0 = get_Tc0(meas[0], meas[1], meas[2]);
         }
         gpx.T = Tc;
 
-        if (bR && bc2 && bT2) {
-            TH = get_TH(meas[6], meas[7], meas[8]);
-        }
-
-        if (bH) {
-            RH = get_RH(meas[3], meas[4], meas[5], Tc); // TH, TH-Tc (sensorT - T)
-        }
-        gpx.RH = RH;
-
-
-        if (option_verbose == 4 && (gpx.crc & (crc_PTU | crc_GPS3))==0)
+        if (option_verbose == 4)
         {
             printf("  h: %8.2f   # ", gpx.alt); // crc_GPS3 ?
 
@@ -631,25 +1029,17 @@ int get_PTU() {
             printf("   #   ");
             printf("3: %8d %8d %8d", meas[6], meas[7], meas[8]);
             printf("   #   ");
-
-            //if (Tc > -273.0 && RH > -0.5)
-            {
-                printf("  ");
-                printf(" Tc:%.2f ", Tc);
-                printf(" RH:%.1f ", RH);
-                printf(" TH:%.2f ", TH);
+            if (Tc > -273.0) {
+                printf("  T: %8.4f , T0: %8.4f ", Tc, Tc0);
             }
             printf("\n");
 
-            //if (gpx.alt > -400.0)
-            {
+            if (gpx.alt > -100.0) {
                 printf("    %9.2f ; %6.1f ; %6.1f ", gpx.alt, Rf1, Rf2);
-                printf("; %10.6f ; %10.6f ; %10.6f ", calT1[0], calT1[1], calT1[2]);
-                //printf(";  %8d ; %8d ; %8d ", meas[0], meas[1], meas[2]);
-                printf("; %10.6f ; %10.6f ", calH[0], calH[1]);
-                //printf(";  %8d ; %8d ; %8d" , meas[3], meas[4], meas[5]);
-                printf("; %10.6f ; %10.6f ; %10.6f ", calT2[0], calT2[1], calT2[2]);
-                //printf(";  %8d ; %8d ; %8d" , meas[6], meas[7], meas[8]);
+                printf("; %10.6f ; %10.6f ; %10.6f ;", calT1[0], calT1[1], calT1[2]);
+                printf("  %8d ; %8d ; %8d ", meas[0], meas[1], meas[2]);
+                printf("; %10.6f ; %10.6f ; %10.6f ;", calT2[0], calT2[1], calT2[2]);
+                printf("  %8d ; %8d ; %8d" , meas[6], meas[7], meas[8]);
                 printf("\n");
             }
         }
@@ -723,8 +1113,9 @@ int get_GPS1() {
     err = check_CRC(pos_GPS1, pck_GPS1);
     if (err) gpx.crc |= crc_GPS1;
 
-    err |= get_GPSweek(); // no plausibility-check
-    err |= get_GPStime(); // no plausibility-check
+    //err = 0;
+    err |= get_GPSweek();
+    err |= get_GPStime();
 
     return err;
 }
@@ -801,7 +1192,7 @@ int get_GPSkoord() {
     gpx.lat = lat;
     gpx.lon = lon;
     gpx.alt = alt;
-    if ((alt < -1000) || (alt > 80000)) return -3; // plausibility-check: altitude, if ecef=(0,0,0)
+    if ((alt < -1000) || (alt > 80000)) return -3;
 
 
     // ECEF-Velocities
@@ -825,8 +1216,6 @@ int get_GPSkoord() {
     if (dir < 0) dir += 360;
     gpx.vD = dir;
 
-    gpx.numSV = frame[pos_numSats];
-
     return 0;
 }
 
@@ -842,7 +1231,7 @@ int get_GPS3() {
     err = check_CRC(pos_GPS3, pck_GPS3);
     if (err) gpx.crc |= crc_GPS3;
 
-    err |= get_GPSkoord(); // plausibility-check: altitude, if ecef=(0,0,0)
+    err |= get_GPSkoord();
 
     return err;
 }
@@ -856,8 +1245,6 @@ int get_Aux() {
     count7E = 0;
     pos7E = pos_AUX;
 
-    if (frametype(gpx) > 0) return 0; //pos7E == pos7611 ...
-
     // 7Exx: xdata
     while ( pos7E < FRAME_LEN  &&  framebyte(pos7E) == 0x7E ) {
 
@@ -870,8 +1257,7 @@ int get_Aux() {
 
             //fprintf(stdout, " # %02x : ", framebyte(pos7E+2));
             for (i = 1; i < auxlen; i++) {
-                ui8_t c = framebyte(pos7E+2+i);
-                if (c > 0x1E) fprintf(stdout, "%c", c);
+                fprintf(stdout, "%c", framebyte(pos7E+2+i));
             }
             count7E++;
             pos7E += 2+auxlen+2;
@@ -915,18 +1301,18 @@ int get_Calconf(int out) {
         fprintf(stdout, " ");
     }
 
-    if (out && err == 0)
+    if (out)
     {
         if (calfr == 0x01  &&  option_verbose /*== 2*/) {
             fw = framebyte(pos_CalData+6) | (framebyte(pos_CalData+7)<<8);
-            fprintf(stdout, ": fw 0x%04x ", fw);
+            if (err == 0) fprintf(stdout, ": fw 0x%04x ", fw);
         }
 
         if (calfr == 0x02  &&  option_verbose /*== 2*/) {
             byte = framebyte(pos_Calburst);
             burst = byte;   // fw >= 0x4ef5, BK irrelevant? (burst-killtimer in 0x31?)
-            fprintf(stdout, ": BK %02X ", burst);
-            if (option_verbose == 3) { // killtimer
+            if (err == 0) fprintf(stdout, ": BK %02X ", burst);
+            if (err == 0 && option_verbose == 3) { // killtimer
                 int kt = frame[0x5A] + (frame[0x5B] << 8); // short?
                 if ( kt != 0xFFFF ) fprintf(stdout, ": kt 0x%04x = %dsec = %.1fmin ", kt, kt, kt/60.0);
             }
@@ -938,18 +1324,14 @@ int get_Calconf(int out) {
             byte = framebyte(pos_Calfreq+1);
             f1 = 40 * byte;
             freq = 400000 + f1+f0; // kHz;
-            fprintf(stdout, ": fq %d ", freq);
+            if (err == 0) fprintf(stdout, ": fq %d ", freq);
         }
 
         if (calfr == 0x31  &&  option_verbose == 3) {
-            int bt = frame[0x59] + (frame[0x5A] << 8); // short?
-            // fw >= 0x4ef5: default=[88 77]=0x7788sec=510min
-            if ( bt != 0x0000 ) fprintf(stdout, ": bt 0x%04x = %dsec = %.1fmin ", bt, bt, bt/60.0);
-        }
-
-        if (calfr == 0x32  &&  option_verbose) {
-            ui16_t cd = frame[pos_CalData+1] + (frame[pos_CalData+2] << 8); // countdown (bt or kt) (short?)
-            if ( cd != 0xFFFF ) fprintf(stdout, ": cd %.1fmin ", cd/60.0);
+            if (err == 0) { // fw >= 0x4ef5: default=[88 77]=0x7788sec=510min
+                int bt = frame[0x59] + (frame[0x5A] << 8); // short?
+                if ( bt != 0x0000 ) fprintf(stdout, ": bt 0x%04x = %dsec = %.1fmin ", bt, bt, bt/60.0);
+            }
         }
 
         if (calfr == 0x21  &&  option_verbose /*== 2*/) {  // eventuell noch zwei bytes in 0x22
@@ -959,11 +1341,25 @@ int get_Calconf(int out) {
                 if ((byte >= 0x20) && (byte < 0x7F)) sondetyp[i] = byte;
                 else if (byte == 0x00) sondetyp[i] = '\0';
             }
-            fprintf(stdout, ": %s ", sondetyp);
+            if (err == 0) fprintf(stdout, ": %s ", sondetyp);
         }
     }
 
     return 0;
+}
+
+/*
+  frame[pos_FRAME-1] == 0x0F: len == NDATA_LEN(320)
+  frame[pos_FRAME-1] == 0xF0: len == FRAME_LEN(518)
+*/
+int frametype() { // -4..+4: 0xF0 -> -4 , 0x0F -> +4
+    int i;
+    ui8_t b = frame[pos_FRAME-1];
+    int ft = 0;
+    for (i = 0; i < 4; i++) {
+        ft += ((b>>i)&1) - ((b>>(i+4))&1);
+    }
+    return ft;
 }
 
 /* ------------------------------------------------------------------------------------ */
@@ -1018,25 +1414,14 @@ int rs41_ecc(int frmlen) {
     errors2 = rs_decode(cw2, err_pos2, err_val2);
 
 
-    if (option_ecc == 2 && (errors1 < 0 || errors2 < 0))
-    {   // 2nd pass
+    if (option_ecc == 2 && (errors1 < 0 || errors2 < 0)) {
         frame[pos_FRAME] = (pck_FRAME>>8)&0xFF; frame[pos_FRAME+1] = pck_FRAME&0xFF;
         frame[pos_PTU]   = (pck_PTU  >>8)&0xFF; frame[pos_PTU  +1] = pck_PTU  &0xFF;
         frame[pos_GPS1]  = (pck_GPS1 >>8)&0xFF; frame[pos_GPS1 +1] = pck_GPS1 &0xFF;
         frame[pos_GPS2]  = (pck_GPS2 >>8)&0xFF; frame[pos_GPS2 +1] = pck_GPS2 &0xFF;
         frame[pos_GPS3]  = (pck_GPS3 >>8)&0xFF; frame[pos_GPS3 +1] = pck_GPS3 &0xFF;
-        // AUX-frames mit vielen Fehlern besser mit 00 auffuellen
-        // std-O3-AUX-frame: NDATA+7
-        if (frametype() < -2) {  // ft >= 0: NDATA_LEN , ft < 0: FRAME_LEN
+        if (frametype() < -2) {
             for (i = NDATA_LEN + 7; i < FRAME_LEN-2; i++) frame[i] = 0;
-        }
-        else { // std-frm (len=320): std_ZERO-frame (7611 00..00 ECC7)
-            for (i = NDATA_LEN; i < FRAME_LEN; i++) frame[i] = 0;
-            frame[pos_ZEROstd  ] = 0x76;  // pck_ZEROstd
-            frame[pos_ZEROstd+1] = 0x11;  // pck_ZEROstd
-            for (i = pos_ZEROstd+2; i < NDATA_LEN-2; i++) frame[i] = 0;
-            frame[NDATA_LEN-2] = 0xEC;    // crc(pck_ZEROstd)
-            frame[NDATA_LEN-1] = 0xC7;    // crc(pck_ZEROstd)
         }
         for (i = 0; i < rs_K; i++) cw1[rs_R+i] = frame[cfg_rs41.msgpos+2*i  ];
         for (i = 0; i < rs_K; i++) cw2[rs_R+i] = frame[cfg_rs41.msgpos+2*i+1];
@@ -1118,67 +1503,55 @@ int print_position(int ec) {
             //if (option_verbose)
             {
                 //fprintf(stdout, "  (%.1f %.1f %.1f) ", gpx.vN, gpx.vE, gpx.vU);
-                fprintf(stdout,"  vH: %4.1f  D: %5.1f  vV: %3.1f ", gpx.vH, gpx.vD, gpx.vU);
-                if (option_verbose == 3) fprintf(stdout," numSV: %02d ", gpx.numSV);
+                fprintf(stdout,"  vH: %4.1f  D: %5.1f°  vV: %3.1f ", gpx.vH, gpx.vD, gpx.vU);
             }
         }
         if (option_ptu && !err0) {
-            printf(" ");
-            if (gpx.T > -273.0) printf(" T=%.1fC ", gpx.T);
-            if (gpx.RH > -0.5)  printf(" RH=%.0f%% ", gpx.RH);
+            if (gpx.T > -273.0) printf("  T=%.1fC ", gpx.T);
         }
 
 
-        if (option_crc) { // show CRC-checks (and RS-check)
-            fprintf(stdout, " # ");
-            if (option_ecc && ec >= 0 && (gpx.crc & 0x1F) != 0) {
-                int pos, blk, len, crc;   // unexpected blocks
-                int flen = NDATA_LEN;
-                if (frametype() < 0) flen += XDATA_LEN;
-                pos = pos_FRAME;
-                while (pos < flen-1) {
-                    blk = frame[pos];     // 0x80XX: encrypted block
-                    len = frame[pos+1];   // 0x76XX: 00-padding block
-                    crc = check_CRC(pos, blk<<8);
-                    fprintf(stdout, " %02X%02X", frame[pos], frame[pos+1]);
-                    fprintf(stdout, "[%d]", crc&1);
-                    pos = pos+2+len+2;
+        //if (output)
+        {
+            if (option_crc) {
+                fprintf(stdout, " # ");
+                if (option_ecc && ec >= 0 && (gpx.crc & 0x1F) != 0) {
+                    int pos, blk, len, crc;   // unexpected blocks
+                    int flen = NDATA_LEN;
+                    if (frametype() < 0) flen += XDATA_LEN;
+                    pos = pos_FRAME;
+                    while (pos < flen-1) {
+                        blk = frame[pos];     // 0x80XX: encrypted block
+                        len = frame[pos+1];   // 0x76XX: 00-padding block
+                        crc = check_CRC(pos, blk<<8);
+                        fprintf(stdout, " %02X%02X", frame[pos], frame[pos+1]);
+                        fprintf(stdout, "[%d]", crc&1);
+                        pos = pos+2+len+2;
+                    }
                 }
-            }
-            else {
-                fprintf(stdout, "[");
-                for (i=0; i<5; i++) fprintf(stdout, "%d", (gpx.crc>>i)&1);
-                fprintf(stdout, "]");
-            }
-            if (option_ecc == 2) {
-                if (ec > 0) fprintf(stdout, " (%d)", ec);
-                if (ec < 0) {
-                    if      (ec == -1)  fprintf(stdout, " (-+)");
-                    else if (ec == -2)  fprintf(stdout, " (+-)");
-                    else   /*ec == -3*/ fprintf(stdout, " (--)");
+                else {
+                    fprintf(stdout, "[");
+                    for (i=0; i<5; i++) fprintf(stdout, "%d", (gpx.crc>>i)&1);
+                    fprintf(stdout, "]");
+                }
+                if (option_ecc == 2) {
+                    if (ec > 0) fprintf(stdout, " (%d)", ec);
+                    if (ec < 0) {
+                        if      (ec == -1)  fprintf(stdout, " (-+)");
+                        else if (ec == -2)  fprintf(stdout, " (+-)");
+                        else   /*ec == -3*/ fprintf(stdout, " (--)");
+                    }
                 }
             }
         }
 
         get_Calconf(output);
 
-        if (option_verbose > 1) get_Aux();
-
-        fprintf(stdout, "\n");  // fflush(stdout);
-
-
-        if (option_json) {
-            // Print JSON output required by auto_rx.
-            if (!err && !err1 && !err3) { // frame-nb/id && gps-time && gps-position  (crc-)ok; 3 CRCs, RS not needed
-                if (option_ptu && !err0 && gpx.T > -273.0) {
-                    printf("{ \"frame\": %d, \"id\": \"%s\", \"datetime\": \"%04d-%02d-%02dT%02d:%02d:%06.3fZ\", \"lat\": %.5f, \"lon\": %.5f, \"alt\": %.5f, \"vel_h\": %.5f, \"heading\": %.5f, \"vel_v\": %.5f, \"sats\": %d, \"temp\":%.1f }\n",  gpx.frnr, gpx.id, gpx.jahr, gpx.monat, gpx.tag, gpx.std, gpx.min, gpx.sek, gpx.lat, gpx.lon, gpx.alt, gpx.vH, gpx.vD, gpx.vU, gpx.numSV, gpx.T );
-                } else {
-                    printf("{ \"frame\": %d, \"id\": \"%s\", \"datetime\": \"%04d-%02d-%02dT%02d:%02d:%06.3fZ\", \"lat\": %.5f, \"lon\": %.5f, \"alt\": %.5f, \"vel_h\": %.5f, \"heading\": %.5f, \"vel_v\": %.5f, \"sats\": %d }\n",  gpx.frnr, gpx.id, gpx.jahr, gpx.monat, gpx.tag, gpx.std, gpx.min, gpx.sek, gpx.lat, gpx.lon, gpx.alt, gpx.vH, gpx.vD, gpx.vU, gpx.numSV );
-                }
-                printf("\n");
-            }
+        //if (output)
+        {
+            if (option_verbose > 1) get_Aux();
+            fprintf(stdout, "\n");  // fflush(stdout);
         }
-
     }
 
     err |=  err1 | err3;
@@ -1218,8 +1591,14 @@ void print_frame(int len) {
         ec = rs41_ecc(len);
     }
 
-
     if (option_raw) {
+/*
+        for (i = 0; i < len; i++) {
+            byte = framebyte(i);
+            fprintf(stdout, "%02x", byte);
+        }
+        fprintf(stdout, "\n");
+*/
         if (option_ecc == 2 && ec >= 0) {
             if (len < FRAME_LEN && frame[FRAME_LEN-1] != 0) len = FRAME_LEN;
         }
@@ -1228,16 +1607,10 @@ void print_frame(int len) {
         }
         if (option_ecc) {
             if (ec >= 0) fprintf(stdout, " [OK]"); else fprintf(stdout, " [NO]");
-            if (option_ecc == 2) {
-                if (ec > 0) fprintf(stdout, " (%d)", ec);
-                if (ec < 0) {
-                    if      (ec == -1)  fprintf(stdout, " (-+)");
-                    else if (ec == -2)  fprintf(stdout, " (+-)");
-                    else   /*ec == -3*/ fprintf(stdout, " (--)");
-                }
-            }
+            if (option_ecc == 2 && ec > 0) fprintf(stdout, " (%d)", ec);
         }
         fprintf(stdout, "\n");
+//        fprintf(stdout, "\n");
     }
     else if (option_sat) {
         get_SatData();
@@ -1247,34 +1620,23 @@ void print_frame(int len) {
     }
 }
 
-
 int main(int argc, char *argv[]) {
 
     FILE *fp;
-    char *fpname = NULL;
-    float spb = 0.0;
+    char *fpname;
     char bitbuf[8];
     int bit_count = 0,
-        bitpos = 0,
         byte_count = FRAMESTART,
         ft_len = FRAME_LEN,
-        header_found = 0;
-    int bit, byte;
-    int frmlen = FRAME_LEN;
-    int headerlen;
-    int herrs, herr1;
-    int bitQ, Qerror_count;
+        header_found = 0,
+        byte, i, j;
+    int bit, len,
+        frmlen = FRAME_LEN;
+    char *pbuf = NULL,
+         *buf_sp = NULL;
 
-    int k, K;
-    float mv;
-    unsigned int mv_pos, mv0_pos;
-    int mp = 0;
-
-    float thres = 0.7;
-
-    int symlen = 1;
-    int bitofs = 2;
-    int shift = 0;
+    int sumQ, bitQ, Qerror_count;
+    double ratioQ;
 
 
 #ifdef CYGWIN
@@ -1291,11 +1653,14 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "       -v, -vx, -vv  (info, aux, info/conf)\n");
             fprintf(stderr, "       -r, --raw\n");
             fprintf(stderr, "       -i, --invert\n");
+            //fprintf(stderr, "       --avg        (moving average)\n");
+            fprintf(stderr, "       -b           (alt. Demod.)\n");
             fprintf(stderr, "       --crc        (check CRC)\n");
             fprintf(stderr, "       --ecc        (Reed-Solomon)\n");
-            fprintf(stderr, "       --std        (std framelen)\n");
-            fprintf(stderr, "       --ths <x>    (peak threshold; default=%.1f)\n", thres);
-            fprintf(stderr, "       --json       (JSON output)\n");
+            fprintf(stderr, "       --std        (std  framelen 320)\n");
+            fprintf(stderr, "       --std2       (full framelen 518)\n");
+            fprintf(stderr, "       --sat        (GPS Sat data)\n");
+            fprintf(stderr, "       --ptu        (temperature)\n");
             return 0;
         }
         else if ( (strcmp(*argv, "-v") == 0) || (strcmp(*argv, "--verbose") == 0) ) {
@@ -1312,30 +1677,22 @@ int main(int argc, char *argv[]) {
         else if ( (strcmp(*argv, "-i") == 0) || (strcmp(*argv, "--invert") == 0) ) {
             option_inv = 1;
         }
+        else if ( (strcmp(*argv, "--avg") == 0) ) {
+            option_avg = 1;
+        }
+        else if   (strcmp(*argv, "-b") == 0) { option_b = 1; }
         else if   (strcmp(*argv, "--ecc" ) == 0) { option_ecc = 1; }
         else if   (strcmp(*argv, "--ecc2") == 0) { option_ecc = 2; }
-        else if   (strcmp(*argv, "--std" ) == 0) { frmlen = 320; }  // NDATA_LEN
-        else if   (strcmp(*argv, "--std2") == 0) { frmlen = 518; }  // NDATA_LEN+XDATA_LEN
+        else if   (strcmp(*argv, "--std" ) == 0) { option_len = 1; frmlen = 320; }  // NDATA_LEN
+        else if   (strcmp(*argv, "--std2") == 0) { option_len = 2; frmlen = 518; }  // NDATA_LEN+XDATA_LEN
         else if   (strcmp(*argv, "--sat") == 0) { option_sat = 1; }
         else if   (strcmp(*argv, "--ptu") == 0) { option_ptu = 1; }
-        else if   (strcmp(*argv, "--json") == 0) { option_json = 1; option_ecc = 2; option_crc = 1; }
         else if   (strcmp(*argv, "--ch2") == 0) { wav_channel = 1; }  // right channel (default: 0=left)
-        else if   (strcmp(*argv, "--ths") == 0) {
-            ++argv;
-            if (*argv) {
-                thres = atof(*argv);
-            }
-            else return -1;
-        }
-        else if ( (strcmp(*argv, "-d") == 0) ) {
-            ++argv;
-            if (*argv) {
-                shift = atoi(*argv);
-                if (shift >  4) shift =  4;
-                if (shift < -4) shift = -4;
-            }
-            else return -1;
-        }
+        else if   (strcmp(*argv, "--rawin1") == 0) { rawin = 2; }     // raw_txt input1
+        else if   (strcmp(*argv, "--rawin2") == 0) { rawin = 3; }     // raw_txt input2
+        else if   (strcmp(*argv, "--iq") == 0) { option_iq = 1; }  // differential/FM-demod
+        else if   (strcmp(*argv, "--iq2") == 0) { option_iq = 2; option_b = 1; }
+        else if   (strcmp(*argv, "--iq3") == 0) { option_iq = 3; option_b = 1; }
         else {
             fp = fopen(*argv, "rb");
             if (fp == NULL) {
@@ -1349,119 +1706,195 @@ int main(int argc, char *argv[]) {
     if (!wavloaded) fp = stdin;
 
 
-    spb = read_wav_header(fp, (float)BAUD_RATE, wav_channel);
-    if ( spb < 0 ) {
-        fclose(fp);
-        fprintf(stderr, "error: wav header\n");
-        return -1;
-    }
-    if ( spb < 8 ) {
-        fprintf(stderr, "note: sample rate low\n");
-    }
-
-
     if (option_ecc) {
         rs_init_RS255();
     }
 
 
-    symlen = 1;
-    bitofs += shift;
+    if (!rawin) {
 
-    headerlen = strlen(header);
-    K = init_buffers(header, headerlen, 2); // shape=2
-    if ( K < 0 ) {
-        fprintf(stderr, "error: init buffers\n");
-        return -1;
-    };
-
-
-    k = 0;
-    mv = 0;
-    mv_pos = 0;
-
-    while ( f32buf_sample(fp, option_inv) != EOF ) {
-
-        k += 1;
-        if (k >= K-4) {
-            mv0_pos = mv_pos;
-            mp = getCorrDFT(K, 0, &mv, &mv_pos);
-            k = 0;
-        }
-        else {
-            mv = 0.0;
-            continue;
+        i = read_wav_header(fp);
+        if (i) {
+            fclose(fp);
+            return -1;
         }
 
-        if (mv > thres && mp > 0) {
-            if (mv_pos > mv0_pos) {
 
-                header_found = 0;
-                herrs = headcmp(symlen, header, headerlen, mv_pos, mv<0, 0); // symlen=1
-                herr1 = 0;
-                if (herrs <= 3 && herrs > 0) {
-                    herr1 = headcmp(symlen, header, headerlen, mv_pos+1, mv<0, 0);
-                    if (herr1 < herrs) {
-                        herrs = herr1;
-                        herr1 = 1;
-                    }
-                }
-                if (herrs <= 2) header_found = 1; // herrs <= 2 bitfehler in header
+        if (option_iq)
+        {
+            if (channels < 2) return -1;
 
-                if (header_found) {
+            LOG2N = 0;
+            M_DFT = samples_per_bit*256+0.5;
+            while ( (1 << LOG2N) < M_DFT ) LOG2N++;
+            LOG2N++;
+            N_DFT = (1 << LOG2N);
+            init_dft();
+            N_IQBUF = M_DFT + samples_per_bit*(64+16);
+            raw_iqbuf = calloc(N_IQBUF+1, sizeof(complex double));  if (raw_iqbuf == NULL) return -1;
+            rot_iqbuf = calloc(N_IQBUF+1, sizeof(complex double));  if (rot_iqbuf == NULL) return -1;
 
+            len_sq = samples_per_bit*8;
+        }
+
+        if (option_b)
+        {
+            Nvar = 32*samples_per_bit;
+            bufvar  = (float *)calloc( Nvar+1, sizeof(float)); if (bufvar  == NULL) return -1;
+            for (i = 0; i < Nvar; i++) bufvar[i] = 0;
+        }
+
+        while (!read_bits_fsk(fp, &bit, &len)) {
+
+            if (len == 0) { // reset_frame();
+                if (byte_count > pos_AUX) {
+                    print_frame(byte_count);
+                    bit_count = 0;
                     byte_count = FRAMESTART;
-                    bit_count = 0; // byte_count*8-HEADLEN
-                    bitpos = 0;
-
-                    Qerror_count = 0;
-                    ft_len = frmlen;
-
-                    while ( byte_count < frmlen ) {
-                        bitQ = read_sbit(fp, symlen, &bit, option_inv, bitofs, bit_count==0); // symlen=1
-                        if ( bitQ == EOF) break;
-                        bit_count += 1;
-                        bitbuf[bitpos] = bit;
-                        bitpos++;
-                        if (bitpos == BITS) {
-                            bitpos = 0;
-                            byte = bits2byte(bitbuf);
-                            frame[byte_count] = byte ^ mask[byte_count % MASK_LEN];
-
-                            byteQ[byte_count] = get_bufvar(0);
-
-                            if (byte_count > NDATA_LEN) { // Fehler erst ab minimaler framelen Zaehlen
-                                if (byteQ[byte_count]*2 > byteQ[byte_count-300]*3) { // Var(frame)/Var(noise) ca. 1:2
-                                    Qerror_count += 1;
-                                }
-                            }
-
-                            byte_count++;
-                        }
-                        if (Qerror_count == 4) { // framelen = 320 oder 518
-                            ft_len = byte_count;
-                            Qerror_count += 1;
-                        }
-                    }
-
-                    print_frame(ft_len);
                     header_found = 0;
-
-                    while ( bit_count < BITS*(FRAME_LEN-8+24) ) {
-                        bitQ = read_sbit(fp, symlen, &bit, option_inv, bitofs, bit_count==0); // symlen=1
-                        if ( bitQ == EOF) break;
-                        bit_count++;
-                    }
-
-                    byte_count = FRAMESTART;
                 }
+                //inc_bufpos();
+                //buf[bufpos] = 'x';
+                continue;   // ...
             }
+
+            for (i = 0; i < len; i++) {
+
+                inc_bufpos();
+                buf[bufpos] = 0x30 + bit;  // Ascii
+
+                if (!header_found) {
+                    if (compare() >= HEADLEN) header_found = 1;
+
+                    if (header_found && option_iq) {
+                        int buf_start = sample_count - (HEADOFS+HEADLEN+(len-i)+256)*samples_per_bit;
+                        while (buf_start < 0) buf_start += N_IQBUF;
+                        for (j = 0; j < M_DFT; j++) {
+                           xn[j] = Hann[j]*raw_iqbuf[(buf_start+j) % N_IQBUF]; // Hann[j]*buffer[(ptr + j + 1)%N];
+                        }
+                        dft2();
+                        db_power(Z, db);
+                        df = bin2freq(max_bin());
+#if defined(DBG) || defined(DBG1)
+                        fprintf(stderr, "fq-ofs: %+.1f Hz\n", df);
+#endif
+                        // if |df|<eps, +-2400Hz dominant
+                        if (fabs(df) > 1000.0) df = 0.0;
+
+                        sample_head_start = sample_count - (HEADOFS+HEADLEN+(len-i-1))*samples_per_bit;
+                        sample_framestart = sample_head_start + 64*samples_per_bit;
+                        sample_posnoise = sample_framestart + sample_rate*7/8.0;
+#ifdef DBG1
+                        double phase0 = carg(rot_iqbuf[sample_head_start % N_IQBUF]);
+                        fprintf(stderr, "%lu  phase0 : %+.2f\n", sample_count, phase0/M_PI);
+#endif
+                    }
+                }
+                else {
+                    bitbuf[bit_count] = bit;
+                    bit_count++;
+
+                    if (bit_count == 8) {
+                        bit_count = 0;
+                        byte = bits2byte(bitbuf);
+                        //xframe[byte_count] = byte;
+                        frame[byte_count] = byte ^ mask[byte_count % MASK_LEN];
+                        byte_count++;
+                        if (byte_count == frmlen) {
+                            byte_count = FRAMESTART;
+                            header_found = 0;
+                            print_frame(frmlen);
+                        }
+                    }
+                }
+
+            }
+            if (header_found && option_b) {
+                bitstart = 1;
+                sumQ = 0;
+                Qerror_count = 0;
+                ft_len = frmlen;
+
+                while ( byte_count < frmlen ) {
+                    bitQ = read_rawbit(fp, &bit); // return: zeroX/bit (oder alternativ Varianz/bit)
+                    if ( bitQ == EOF) break;
+                    sumQ += bitQ; // zeroX/byte
+                    bitbuf[bit_count] = bit;
+                    bit_count++;
+                    if (bit_count == 8) {
+                        bit_count = 0;
+                        byte = bits2byte(bitbuf);
+                        //xframe[byte_count] = byte;
+                        frame[byte_count] = byte ^ mask[byte_count % MASK_LEN];
+
+                        mu = xsum/(float)Nvar;
+                        bvar[byte_count] = qsum/(float)Nvar - mu*mu;
+
+                        if (byte_count > NDATA_LEN) {  // Fehler erst ab minimaler framelen Zaehlen
+                            //ratioQ = sumQ/samples_per_bit; // approx: bei Rauschen zeroX/byte leider nicht linear in sample_rate
+                            //if (ratioQ > 0.7) {            // sr=48k: 0.7, Schwelle, ab wann wahrscheinlich Rauschbit
+                            if (bvar[byte_count]*2 > bvar[byte_count-300]*3) { // Var(frame)/Var(noise) ca. 1:2
+                                Qerror_count += 1;
+                            }
+                        }
+                        sumQ = 0; // Fenster fuer zeroXcount: 8 bit
+
+                        byte_count++;
+                    }
+                    if (Qerror_count == 4 && option_len == 0) { // framelen = 320 oder 518
+                        ft_len = byte_count;
+                        Qerror_count += 1;
+                    }
+                }
+                header_found = 0;
+                print_frame(ft_len);
+                byte_count = FRAMESTART;
+            }
+
+        }
+
+        if (option_b)
+        {
+            if (bufvar)  { free(bufvar); bufvar = NULL; }
+        }
+        if (option_iq)
+        {
+            if (raw_iqbuf)  { free(raw_iqbuf); raw_iqbuf = NULL; }
+            if (rot_iqbuf)  { free(rot_iqbuf); rot_iqbuf = NULL; }
+            free_dft();
         }
 
     }
+    else //if (rawin)
+    {
+        if (rawin == 3) frameofs = 8;
+        else            frameofs = 0;
 
+        while (1 > 0) {
 
-    free_buffers();
+            pbuf = fgets(buffer_rawin, rawin*FRAME_LEN+12, fp);
+            if (pbuf == NULL) break;
+            buffer_rawin[rawin*FRAME_LEN] = '\0';
+            if (rawin == 2) {
+                buf_sp = strchr(buffer_rawin, ' ');
+                if (buf_sp != NULL && buf_sp-buffer_rawin < rawin*FRAME_LEN) {
+                    buffer_rawin[buf_sp-buffer_rawin] = '\0';
+                }
+            }
+            len = strlen(buffer_rawin) / rawin;
+            if (len > pos_SondeID+10) {
+                for (i = 0; i < len; i++) { //%2x  SCNx8=%hhx(inttypes.h)
+                    sscanf(buffer_rawin+rawin*i, "%2hhx", frame+frameofs+i);
+                    // wenn ohne %hhx: sscanf(buffer_rawin+rawin*i, "%2x", &byte); frame[frameofs+i] = (ui8_t)byte;
+                }
+                if (rawin == 3) {
+                    len += frameofs;
+                    if ((frame[NDATA_LEN-1]<<8)+frame[NDATA_LEN-2] == 0xc7ec) len = NDATA_LEN; //**//
+                }
+                print_frame(len);
+            }
+        }
+    }
 
     fclose(fp);
 

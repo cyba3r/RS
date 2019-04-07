@@ -2,10 +2,10 @@
 /*
  *  m10
  *  sync header: correlation/matched filter
- *  files: m10dm_dft.c demod_dft.h demod_dft.c
+ *  files: m10mod.c demod_mod.h demod_mod.c
  *  compile:
- *      gcc -c demod_dft.c
- *      gcc m10dm_dft.c demod_dft.o -lm -o m10dm_dft
+ *      gcc -c demod_mod.c
+ *      gcc m10mod.c demod_mod.o -lm -o m10mod
  *
  *  author: zilog80
  */
@@ -21,36 +21,71 @@
 #endif
 
 
-typedef unsigned char  ui8_t;
-typedef unsigned short ui16_t;
-typedef unsigned int   ui32_t;
-
-//#include "demod_dft.c"
-#include "demod_dft.h"
+#include "demod_mod.h"
 
 
 typedef struct {
-    int week; int gpssec;
+    i8_t vbs;  // verbose output
+    i8_t raw;  // raw frames
+    i8_t crc;  // CRC check output
+    i8_t ecc;  // Reed-Solomon ECC
+    i8_t sat;  // GPS sat data
+    i8_t ptu;  // PTU: temperature
+    i8_t inv;
+    i8_t aut;
+    i8_t col;  // colors
+    i8_t jsn;  // JSON output (auto_rx)
+} option_t;
+
+
+/*
+   9600 baud -> 9616 baud ?
+*/
+#define BAUD_RATE   9615  // 9614..9616
+
+/* -------------------------------------------------------------------------- */
+
+/*
+Header = Sync-Header + Sonde-Header:
+1100110011001100 1010011001001100  1101010011010011 0100110101010101 0011010011001100
+uudduudduudduudd ududduuddudduudd  uudududduududduu dudduudududududu dduududduudduudd (oder:)
+dduudduudduudduu duduudduuduudduu  ddududuudduduudd uduuddududududud uudduduudduudduu (komplement)
+ 0 0 0 0 0 0 0 0  1 1 - - - 0 0 0   0 1 1 0 0 1 0 0  1 0 0 1 1 1 1 1  0 0 1 0 0 0 0 0
+*/
+
+#define BITS 8
+#define HEADLEN 32  // HEADLEN+HEADOFS=32 <= strlen(header)
+#define HEADOFS  0
+                 // Sync-Header (raw)               // Sonde-Header (bits)
+//char head[] = "11001100110011001010011001001100"; //"0110010010011111"; // M10: 64 9F , M2K2: 64 8F
+                                                    //"0111011010011111"; // M10: 76 9F , w/ aux-data
+                                                    //"0110010001001001"; // M10-dop: 64 49 09
+                                                    //"0110010010101111"; // M10+: 64 AF w/ gtop-GPS
+static char rawheader[] = "10011001100110010100110010011001";
+
+#define FRAME_LEN       (100+1)   // 0x64+1
+#define BITFRAME_LEN    (FRAME_LEN*BITS)
+
+#define AUX_LEN          20
+#define BITAUX_LEN      (AUX_LEN*BITS)
+
+
+typedef struct {
+    int week; int tow_ms; int gpssec;
     int jahr; int monat; int tag;
     int wday;
-    int std; int min; int sek;
+    int std; int min; float sek;
     double lat; double lon; double alt;
     double vH; double vD; double vV;
     double vx; double vy; double vD2;
+    ui8_t numSV;
+    ui8_t utc_ofs;
     char SN[12];
-} datum_t;
-
-datum_t datum;
-
-int option_verbose = 0,  // ausfuehrliche Anzeige
-    option_raw = 0,      // rohe Frames
-    option_inv = 0,      // invertiert Signal
-    option_res = 0,      // genauere Bitmessung
-    option_color = 0,
-    option_ptu = 0,
-    option_dc = 0,
-    wavloaded = 0;
-int wav_channel = 0;     // audio channel: left
+    ui8_t frame_bytes[FRAME_LEN+AUX_LEN+4];
+    char frame_bits[BITFRAME_LEN+BITAUX_LEN+8];
+    int auxlen; // 0 .. 0x76-0x64
+    option_t option;
+} gpx_t;
 
 
 /* -------------------------------------------------------------------------- */
@@ -59,7 +94,7 @@ int wav_channel = 0;     // audio channel: left
  * - Adapted from sci.astro FAQ.
  * - Ignores UTC leap seconds.
  */
-void Gps2Date(long GpsWeek, long GpsSeconds, int *Year, int *Month, int *Day) {
+static void Gps2Date(long GpsWeek, long GpsSeconds, int *Year, int *Month, int *Day) {
 
     long GpsDays, Mjd;
     long J, C, Y, M;
@@ -80,45 +115,7 @@ void Gps2Date(long GpsWeek, long GpsSeconds, int *Year, int *Month, int *Day) {
 }
 /* -------------------------------------------------------------------------- */
 
-/*
-   9600 baud -> 9616 baud ?
-*/
-#define BAUD_RATE   9616
-
-/* -------------------------------------------------------------------------- */
-
-/*
-Header = Sync-Header + Sonde-Header:
-1100110011001100 1010011001001100  1101010011010011 0100110101010101 0011010011001100
-uudduudduudduudd ududduuddudduudd  uudududduududduu dudduudududududu dduududduudduudd (oder:)
-dduudduudduudduu duduudduuduudduu  ddududuudduduudd uduuddududududud uudduduudduudduu (komplement)
- 0 0 0 0 0 0 0 0  1 1 - - - 0 0 0   0 1 1 0 0 1 0 0  1 0 0 1 1 1 1 1  0 0 1 0 0 0 0 0
-*/
-
-#define BITS 8
-#define HEADLEN 32  // HEADLEN+HEADOFS=32 <= strlen(header)
-#define HEADOFS  0
-                 // Sync-Header (raw)               // Sonde-Header (bits)
-//char head[] = "11001100110011001010011001001100"; //"0110010010011111"; // M10: 64 9F , M2K2: 64 8F
-                                                    //"0111011010011111"; // M10: 76 9F , w/ aux-data
-                                                    //"0110010001001001"; // M10-dop: 64 49 09
-                                                    //"0110010010101111"; // M10+: 64 AF w/ gtop-GPS
-char rawheader[] = "10011001100110010100110010011001";
-
-#define FRAME_LEN       (100+1)   // 0x64+1
-#define BITFRAME_LEN    (FRAME_LEN*BITS)
-
-#define AUX_LEN          20
-#define BITAUX_LEN      (AUX_LEN*BITS)
-
-ui8_t frame_bytes[FRAME_LEN+AUX_LEN+4];
-
-char frame_bits[BITFRAME_LEN+BITAUX_LEN+8];
-
-int auxlen = 0; // 0 .. 0x76-0x64
-
-
-int bits2bytes(char *bitstr, ui8_t *bytes) {
+static int bits2bytes(char *bitstr, ui8_t *bytes) {
     int i, bit, d, byteval;
     int bitpos, bytepos;
 
@@ -149,11 +146,61 @@ int bits2bytes(char *bitstr, ui8_t *bytes) {
 
 /* -------------------------------------------------------------------------- */
 
+/*
+M10 w/ trimble GPS
+
+frame[0x0] = framelen
+frame[0x1] = 0x9F (type M10)
+
+init/noGPS: frame[0x2]=0x23
+GPS: frame[0x2]=0x20 (GPS trimble pck 0x8F-20 sub-id)
+
+frame[0x02..0x21] = GPS trimble pck 0x8F-20 byte 0..31 (sub-id, vel, tow, lat, lon, alt, fix, NumSV, UTC-ofs, week)
+frame[0x22..0x2D] = GPS trimble pck 0x8F-20 byte 32..55:2 (PRN 1..12 only)
+
+Trimble Copernicus II
+GPS packet 0x8F-20 (p.138)
+byte
+0      sub-pck id (always 0x20)
+2-3    velE (i16) 0.005m/s
+4-5    velN (i16) 0.005m/s
+6-7    velU (i16) 0.005m/s
+8-11   TOW (ms)
+12-15  lat (scale 2^32/360) (i32) -90..90
+16-19  lon (scale 2^32/360) (ui32) 0..360 <-> (i32) -180..180
+20-23  alt (i32) mm above ellipsoid)
+24     bit0: vel-scale (0: 0.005m/s)
+26     datum (1: WGS-84)
+27     fix: bit0(0:valid fix, 1:invalid fix), bit2(0:3D, 1:2D)
+28     numSVs
+29     UTC offset = (GPS - UTC) sec
+30-31  GPS week
+32+2*n PRN_(n+1), bit0-5
+
+frame[0x32..0x5C] sensors (rel.hum., temp.)
+frame[0x5D..0x61] SN
+frame[0x62] counter
+frame[0x63..0x64] check  (AUX len=0x76: frame[0x63..0x74], frame[0x75..0x76])
+
+
+6449/10sec-frame:
+GPS trimble pck 0x47 (signal levels): numSats sat1 lev1 sat2 lev2 ..
+frame[0x0] = framelen
+frame[0x1] = 0x49
+frame[0x2] = numSats (max 12)
+frame[0x3+2*n] = PRN_(n+1)
+frame[0x4+2*n] = signal level (float32 -> i8-byte level)
+
+*/
+
+
 #define stdFLEN        0x64  // pos[0]=0x64
 #define pos_GPSTOW     0x0A  // 4 byte
 #define pos_GPSlat     0x0E  // 4 byte
 #define pos_GPSlon     0x12  // 4 byte
 #define pos_GPSalt     0x16  // 4 byte
+#define pos_GPSsats    0x1E  // 1 byte
+#define pos_GPSutc     0x1F  // 1 byte
 #define pos_GPSweek    0x20  // 2 byte
 //Velocity East-North-Up (ENU)
 #define pos_GPSvE      0x04  // 2 byte
@@ -193,35 +240,40 @@ $ for code in  {0..255}
 > done
 */
 
-int get_GPSweek() {
+static int get_GPSweek(gpx_t *gpx) {
     int i;
     unsigned byte;
     ui8_t gpsweek_bytes[2];
     int gpsweek;
 
+    gpx->numSV   = gpx->frame_bytes[pos_GPSsats];
+    gpx->utc_ofs = gpx->frame_bytes[pos_GPSutc];
+
     for (i = 0; i < 2; i++) {
-        byte = frame_bytes[pos_GPSweek + i];
+        byte = gpx->frame_bytes[pos_GPSweek + i];
         gpsweek_bytes[i] = byte;
     }
 
     gpsweek = (gpsweek_bytes[0] << 8) + gpsweek_bytes[1];
-    datum.week = gpsweek;
+    gpx->week = gpsweek;
 
     if (gpsweek < 0 || gpsweek > 3000) return -1;
 
     return 0;
 }
 
-char weekday[7][3] = { "So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
+//char weekday[7][3] = { "So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
+static char weekday[7][4] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
-int get_GPStime() {
+static int get_GPStime(gpx_t *gpx) {
     int i;
     unsigned byte;
     ui8_t gpstime_bytes[4];
-    int gpstime, day; // int ms;
+    int gpstime, day;
+    int ms;
 
     for (i = 0; i < 4; i++) {
-        byte = frame_bytes[pos_GPSTOW + i];
+        byte = gpx->frame_bytes[pos_GPSTOW + i];
         gpstime_bytes[i] = byte;
     }
 
@@ -230,25 +282,27 @@ int get_GPStime() {
         gpstime |= gpstime_bytes[i] << (8*(3-i));
     }
 
-    //ms = gpstime % 1000;
+    gpx->tow_ms = gpstime;
+    ms = gpstime % 1000;
     gpstime /= 1000;
-    datum.gpssec = gpstime;
+    gpx->gpssec = gpstime;
 
     day = gpstime / (24 * 3600);
+    if ((day < 0) || (day > 6)) return -1;
+
     gpstime %= (24*3600);
 
-    if ((day < 0) || (day > 6)) return -1;
-    datum.wday = day;
-    datum.std = gpstime/3600;
-    datum.min = (gpstime%3600)/60;
-    datum.sek = gpstime%60;
+    gpx->wday = day;
+    gpx->std =  gpstime/3600;
+    gpx->min = (gpstime%3600)/60;
+    gpx->sek =  gpstime%60 + ms/1000.0;
 
     return 0;
 }
 
-double B60B60 = 0xB60B60;  // 2^32/360 = 0xB60B60.xxx
+static double B60B60 = (1<<30)/90.0; // 2^32/360 = 2^30/90 = 0xB60B60.711x
 
-int get_GPSlat() {
+static int get_GPSlat(gpx_t *gpx) {
     int i;
     unsigned byte;
     ui8_t gpslat_bytes[4];
@@ -256,7 +310,7 @@ int get_GPSlat() {
     double lat;
 
     for (i = 0; i < 4; i++) {
-        byte = frame_bytes[pos_GPSlat + i];
+        byte = gpx->frame_bytes[pos_GPSlat + i];
         gpslat_bytes[i] = byte;
     }
 
@@ -265,12 +319,12 @@ int get_GPSlat() {
         gpslat |= gpslat_bytes[i] << (8*(3-i));
     }
     lat = gpslat / B60B60;
-    datum.lat = lat;
+    gpx->lat = lat;
 
     return 0;
 }
 
-int get_GPSlon() {
+static int get_GPSlon(gpx_t *gpx) {
     int i;
     unsigned byte;
     ui8_t gpslon_bytes[4];
@@ -278,7 +332,7 @@ int get_GPSlon() {
     double lon;
 
     for (i = 0; i < 4; i++) {
-        byte = frame_bytes[pos_GPSlon + i];
+        byte = gpx->frame_bytes[pos_GPSlon + i];
         gpslon_bytes[i] = byte;
     }
 
@@ -287,12 +341,12 @@ int get_GPSlon() {
         gpslon |= gpslon_bytes[i] << (8*(3-i));
     }
     lon = gpslon / B60B60;
-    datum.lon = lon;
+    gpx->lon = lon;
 
     return 0;
 }
 
-int get_GPSalt() {
+static int get_GPSalt(gpx_t *gpx) {
     int i;
     unsigned byte;
     ui8_t gpsalt_bytes[4];
@@ -300,7 +354,7 @@ int get_GPSalt() {
     double alt;
 
     for (i = 0; i < 4; i++) {
-        byte = frame_bytes[pos_GPSalt + i];
+        byte = gpx->frame_bytes[pos_GPSalt + i];
         gpsalt_bytes[i] = byte;
     }
 
@@ -309,12 +363,12 @@ int get_GPSalt() {
         gpsalt |= gpsalt_bytes[i] << (8*(3-i));
     }
     alt = gpsalt / 1000.0;
-    datum.alt = alt;
+    gpx->alt = alt;
 
     return 0;
 }
 
-int get_GPSvel() {
+static int get_GPSvel(gpx_t *gpx) {
     int i;
     unsigned byte;
     ui8_t gpsVel_bytes[2];
@@ -323,58 +377,58 @@ int get_GPSvel() {
     const double ms2kn100 = 2e2;  // m/s -> knots: 1 m/s = 3.6/1.852 kn = 1.94 kn
 
     for (i = 0; i < 2; i++) {
-        byte = frame_bytes[pos_GPSvE + i];
+        byte = gpx->frame_bytes[pos_GPSvE + i];
         gpsVel_bytes[i] = byte;
     }
     vel16 = gpsVel_bytes[0] << 8 | gpsVel_bytes[1];
     vx = vel16 / ms2kn100; // ost
 
     for (i = 0; i < 2; i++) {
-        byte = frame_bytes[pos_GPSvN + i];
+        byte = gpx->frame_bytes[pos_GPSvN + i];
         gpsVel_bytes[i] = byte;
     }
     vel16 = gpsVel_bytes[0] << 8 | gpsVel_bytes[1];
     vy= vel16 / ms2kn100; // nord
 
-    datum.vx = vx;
-    datum.vy = vy;
-    datum.vH = sqrt(vx*vx+vy*vy);
+    gpx->vx = vx;
+    gpx->vy = vy;
+    gpx->vH = sqrt(vx*vx+vy*vy);
 ///*
     alpha = atan2(vy, vx)*180/M_PI;  // ComplexPlane (von x-Achse nach links) - GeoMeteo (von y-Achse nach rechts)
     dir = 90-alpha;                  // z=x+iy= -> i*conj(z)=y+ix=re(i(pi/2-t)), Achsen und Drehsinn vertauscht
     if (dir < 0) dir += 360;         // atan2(y,x)=atan(y/x)=pi/2-atan(x/y) , atan(1/t) = pi/2 - atan(t)
-    datum.vD2 = dir;
+    gpx->vD2 = dir;
 //*/
     dir = atan2(vx, vy) * 180 / M_PI;
     if (dir < 0) dir += 360;
-    datum.vD = dir;
+    gpx->vD = dir;
 
     for (i = 0; i < 2; i++) {
-        byte = frame_bytes[pos_GPSvU + i];
+        byte = gpx->frame_bytes[pos_GPSvU + i];
         gpsVel_bytes[i] = byte;
     }
     vel16 = gpsVel_bytes[0] << 8 | gpsVel_bytes[1];
-    datum.vV = vel16 / ms2kn100;
+    gpx->vV = vel16 / ms2kn100;
 
     return 0;
 }
 
-int get_SN() {
+static int get_SN(gpx_t *gpx) {
     int i;
     unsigned byte;
     ui8_t sn_bytes[5];
 
-    for (i = 0; i < 11; i++) datum.SN[i] = ' '; datum.SN[11] = '\0';
+    for (i = 0; i < 11; i++) gpx->SN[i] = ' '; gpx->SN[11] = '\0';
 
     for (i = 0; i < 5; i++) {
-        byte = frame_bytes[pos_SN + i];
+        byte = gpx->frame_bytes[pos_SN + i];
         sn_bytes[i] = byte;
     }
 
     byte = sn_bytes[2];
-    sprintf(datum.SN, "%1X%02u", (byte>>4)&0xF, byte&0xF);
+    sprintf(gpx->SN, "%1X%02u", (byte>>4)&0xF, byte&0xF);
     byte = sn_bytes[3] | (sn_bytes[4]<<8);
-    sprintf(datum.SN+3, " %1X %1u%04u", sn_bytes[0]&0xF, (byte>>13)&0x7, byte&0x1FFF);
+    sprintf(gpx->SN+3, " %1X %1u%04u", sn_bytes[0]&0xF, (byte>>13)&0x7, byte&0x1FFF);
 
     return 0;
 }
@@ -405,7 +459,7 @@ f : F^16 x F^8 -> F^16 linear
 000000000000000100000000
 */
 
-int update_checkM10(int c, ui8_t b) {
+static int update_checkM10(int c, ui8_t b) {
     int c0, c1, t, t6, t7, s;
 
     c1 = c & 0xFF;
@@ -429,7 +483,7 @@ int update_checkM10(int c, ui8_t b) {
     return ((c1<<8) | c0) & 0xFFFF;
 }
 
-int checkM10(ui8_t *msg, int len) {
+static int checkM10(ui8_t *msg, int len) {
     int i, cs;
 
     cs = 0;
@@ -445,7 +499,7 @@ int checkM10(ui8_t *msg, int len) {
 // Temperatur Sensor
 // NTC-Thermistor Shibaura PB5-41E
 //
-float get_Temp(int csOK) {
+static float get_Temp(gpx_t *gpx, int csOK) {
 // NTC-Thermistor Shibaura PB5-41E
 // T00 = 273.15 +  0.0 , R00 = 15e3
 // T25 = 273.15 + 25.0 , R25 = 5.369e3
@@ -489,11 +543,11 @@ float get_Temp(int csOK) {
     float x, R;
     float T = 0;    // T/Kelvin
 
-    scT     =  frame_bytes[0x3E]; // adr_0455h
-    ADC_RT  = (frame_bytes[0x40] << 8) | frame_bytes[0x3F];
+    scT     =  gpx->frame_bytes[0x3E]; // adr_0455h
+    ADC_RT  = (gpx->frame_bytes[0x40] << 8) | gpx->frame_bytes[0x3F];
     ADC_RT -= 0xA000;
-    Tcal[0] = (frame_bytes[0x42] << 8) | frame_bytes[0x41];
-    Tcal[1] = (frame_bytes[0x44] << 8) | frame_bytes[0x43];
+    Tcal[0] = (gpx->frame_bytes[0x42] << 8) | gpx->frame_bytes[0x41];
+    Tcal[1] = (gpx->frame_bytes[0x44] << 8) | gpx->frame_bytes[0x43];
 
     x = (adc_max-ADC_RT)/ADC_RT;  // (Vcc-Vout)/Vout
     if (scT < 3) R =  Rs[scT] /( x - Rs[scT]/Rp[scT] );
@@ -501,8 +555,8 @@ float get_Temp(int csOK) {
 
     if (R > 0)  T =  1/( p0 + p1*log(R) + p2*log(R)*log(R) + p3*log(R)*log(R)*log(R) );
 
-    if (option_verbose >= 3 && csOK) { // on-chip temperature
-        ui16_t ADC_Ti_raw = (frame_bytes[0x49] << 8) | frame_bytes[0x48]; // int.temp.diode, ref: 4095->1.5V
+    if (gpx->option.vbs >= 3 && csOK) { // on-chip temperature
+        ui16_t ADC_Ti_raw = (gpx->frame_bytes[0x49] << 8) | gpx->frame_bytes[0x48]; // int.temp.diode, ref: 4095->1.5V
         float vti, ti;
         // INCH1A (temp.diode), slau144
         vti = ADC_Ti_raw/4095.0 * 1.5; // V_REF+ = 1.5V, no calibration
@@ -559,7 +613,7 @@ frame[0x5F]: adr_1084h (SN)
 frame[0x60]: adr_1080h (SN)
 frame[0x61]: adr_1081h (SN)
 */
-float get_Tntc2(int csOK) {
+static float get_Tntc2(gpx_t *gpx, int csOK) {
 // SMD ntc
     float Rs = 22.1e3;          // P5.6=Vcc
 //  float R25 = 2.2e3;
@@ -575,7 +629,7 @@ float get_Tntc2(int csOK) {
     float x, R;
     if (csOK)
     {
-        ADC_ntc2  = (frame_bytes[0x5A] << 8) | frame_bytes[0x59];
+        ADC_ntc2  = (gpx->frame_bytes[0x5A] << 8) | gpx->frame_bytes[0x59];
         x = (4095.0 - ADC_ntc2)/ADC_ntc2;  // (Vcc-Vout)/Vout
         R = Rs / x;
         //if (R > 0)  T = 1/(1/T25 + 1/b * log(R/R25));
@@ -591,12 +645,12 @@ float get_Tntc2(int csOK) {
 #define LN2         0.693147181
 #define ADR_108A    1000.0       // 0x3E8=1000
 
-float get_count_RH() {  // capture 1000 rising edges
-    ui32_t TBCCR1_1000 = frame_bytes[0x35] | (frame_bytes[0x36]<<8) | (frame_bytes[0x37]<<16);
+static float get_count_RH(gpx_t *gpx) {  // capture 1000 rising edges
+    ui32_t TBCCR1_1000 = gpx->frame_bytes[0x35] | (gpx->frame_bytes[0x36]<<8) | (gpx->frame_bytes[0x37]<<16);
     return TBCCR1_1000 / ADR_108A;
 }
-float get_TLC555freq() {
-    return FREQ_CAPCLK / get_count_RH();
+static float get_TLC555freq(gpx_t *gpx) {
+    return FREQ_CAPCLK / get_count_RH(gpx);
 }
 /*
 double get_C_RH() {  // TLC555 astable: R_A=3.65k, R_B=338k
@@ -611,7 +665,7 @@ double get_RH(int csOK) {
 // C_RH = C_RH(RH,T) , RH = RH(C_RH,T)
 // C_RH/C_55 approx.eq. count_RH/count_ref
 // c55=270pF? diff=C_55-c55, T=20C
-    ui32_t c = frame_bytes[0x32] | (frame_bytes[0x33]<<8) | (frame_bytes[0x34]<<16); // CalRef 55%RH , T=20C ?
+    ui32_t c = gpx->frame_bytes[0x32] | (gpx->frame_bytes[0x33]<<8) | (gpx->frame_bytes[0x34]<<16); // CalRef 55%RH , T=20C ?
     double count_ref = c / ADR_108A; // CalRef 55%RH , T=20C ?
     double C_RH = get_C_RH();
     double T = get_Tntc2(csOK);
@@ -620,119 +674,150 @@ double get_RH(int csOK) {
 */
 /* -------------------------------------------------------------------------- */
 
-int print_pos(int csOK) {
-    int err;
+static int print_pos(gpx_t *gpx, int csOK) {
+    int err, err2;
 
     err = 0;
-    err |= get_GPSweek();
-    err |= get_GPStime();
-    err |= get_GPSlat();
-    err |= get_GPSlon();
-    err |= get_GPSalt();
+    err |= get_GPSweek(gpx);
+    err |= get_GPStime(gpx);
+    err |= get_GPSlat(gpx);
+    err |= get_GPSlon(gpx);
+    err |= get_GPSalt(gpx);
+    err2 = get_GPSvel(gpx);
 
     if (!err) {
 
-        Gps2Date(datum.week, datum.gpssec, &datum.jahr, &datum.monat, &datum.tag);
+        Gps2Date(gpx->week, gpx->gpssec, &gpx->jahr, &gpx->monat, &gpx->tag);
 
-        if (option_color) {
+        if (gpx->option.col) {
             fprintf(stdout, col_TXT);
-            fprintf(stdout, " (W "col_GPSweek"%d"col_TXT") ", datum.week);
-            fprintf(stdout, col_GPSTOW"%s"col_TXT" ", weekday[datum.wday]);
-            fprintf(stdout, col_GPSdate"%04d-%02d-%02d"col_TXT" ("col_GPSTOW"%02d:%02d:%02d"col_TXT") ",
-                    datum.jahr, datum.monat, datum.tag, datum.std, datum.min, datum.sek);
-            fprintf(stdout, " lat: "col_GPSlat"%.6f"col_TXT" ", datum.lat);
-            fprintf(stdout, " lon: "col_GPSlon"%.6f"col_TXT" ", datum.lon);
-            fprintf(stdout, " alt: "col_GPSalt"%.2f"col_TXT" ", datum.alt);
-            if (option_verbose) {
-                err |= get_GPSvel();
-                if (!err) {
-                    //if (option_verbose == 2) fprintf(stdout, "  "col_GPSvel"(%.1f , %.1f : %.1f)"col_TXT" ", datum.vx, datum.vy, datum.vD2);
-                    fprintf(stdout, "  vH: "col_GPSvel"%.1f"col_TXT"  D: "col_GPSvel"%.1f"col_TXT"  vV: "col_GPSvel"%.1f"col_TXT" ", datum.vH, datum.vD, datum.vV);
-                }
-                if (option_verbose >= 2) {
-                    get_SN();
-                    fprintf(stdout, "  SN: "col_SN"%s"col_TXT, datum.SN);
-                }
-                if (option_verbose >= 2) {
-                    fprintf(stdout, "  # ");
-                    if (csOK) fprintf(stdout, " "col_CSok"[OK]"col_TXT);
-                    else      fprintf(stdout, " "col_CSno"[NO]"col_TXT);
-                }
+            if (gpx->option.vbs >= 3) fprintf(stdout, " (W "col_GPSweek"%d"col_TXT") ", gpx->week);
+            fprintf(stdout, col_GPSTOW"%s"col_TXT" ", weekday[gpx->wday]);
+            fprintf(stdout, col_GPSdate"%04d-%02d-%02d"col_TXT" "col_GPSTOW"%02d:%02d:%06.3f"col_TXT" ",
+                    gpx->jahr, gpx->monat, gpx->tag, gpx->std, gpx->min, gpx->sek);
+            fprintf(stdout, " lat: "col_GPSlat"%.5f"col_TXT" ", gpx->lat);
+            fprintf(stdout, " lon: "col_GPSlon"%.5f"col_TXT" ", gpx->lon);
+            fprintf(stdout, " alt: "col_GPSalt"%.2f"col_TXT" ", gpx->alt);
+            if (!err2) {
+                //if (gpx->option.vbs == 2) fprintf(stdout, "  "col_GPSvel"(%.1f , %.1f : %.1f)"col_TXT" ", gpx->vx, gpx->vy, gpx->vD2);
+                fprintf(stdout, "  vH: "col_GPSvel"%.1f"col_TXT"  D: "col_GPSvel"%.1f"col_TXT"  vV: "col_GPSvel"%.1f"col_TXT" ", gpx->vH, gpx->vD, gpx->vV);
             }
-            if (option_ptu) {
-                float t = get_Temp(csOK);
+            if (gpx->option.vbs >= 2) {
+                get_SN(gpx);
+                fprintf(stdout, "  SN: "col_SN"%s"col_TXT, gpx->SN);
+            }
+            if (gpx->option.vbs >= 2) {
+                fprintf(stdout, "  # ");
+                if (csOK) fprintf(stdout, " "col_CSok"[OK]"col_TXT);
+                else      fprintf(stdout, " "col_CSno"[NO]"col_TXT);
+            }
+            if (gpx->option.ptu) {
+                float t = get_Temp(gpx, csOK);
                 if (t > -270.0) fprintf(stdout, "  T=%.1fC ", t);
-                if (option_verbose >= 3) {
-                    float t2 = get_Tntc2(csOK);
-                    float fq555 = get_TLC555freq();
+                if (gpx->option.vbs >= 3) {
+                    float t2 = get_Tntc2(gpx, csOK);
+                    float fq555 = get_TLC555freq(gpx);
                     if (t2 > -270.0) fprintf(stdout, " (T2:%.1fC) (%.3fkHz) ", t2, fq555/1e3);
                 }
             }
             fprintf(stdout, ANSI_COLOR_RESET"");
         }
         else {
-            fprintf(stdout, " (W %d) ", datum.week);
-            fprintf(stdout, "%s ", weekday[datum.wday]);
-            fprintf(stdout, "%04d-%02d-%02d (%02d:%02d:%02d) ",
-                    datum.jahr, datum.monat, datum.tag, datum.std, datum.min, datum.sek);
-            fprintf(stdout, " lat: %.6f ", datum.lat);
-            fprintf(stdout, " lon: %.6f ", datum.lon);
-            fprintf(stdout, " alt: %.2f ", datum.alt);
-            if (option_verbose) {
-                err |= get_GPSvel();
-                if (!err) {
-                    //if (option_verbose == 2) fprintf(stdout, "  (%.1f , %.1f : %.1f) ", datum.vx, datum.vy, datum.vD2);
-                    fprintf(stdout, "  vH: %.1f  D: %.1f  vV: %.1f ", datum.vH, datum.vD, datum.vV);
-                }
-                if (option_verbose >= 2) {
-                    get_SN();
-                    fprintf(stdout, "  SN: %s", datum.SN);
-                }
-                if (option_verbose >= 2) {
-                    fprintf(stdout, "  # ");
-                    if (csOK) fprintf(stdout, " [OK]"); else fprintf(stdout, " [NO]");
-                }
+            if (gpx->option.vbs >= 3) fprintf(stdout, " (W %d) ", gpx->week);
+            fprintf(stdout, "%s ", weekday[gpx->wday]);
+            fprintf(stdout, "%04d-%02d-%02d %02d:%02d:%06.3f ",
+                    gpx->jahr, gpx->monat, gpx->tag, gpx->std, gpx->min, gpx->sek);
+            fprintf(stdout, " lat: %.5f ", gpx->lat);
+            fprintf(stdout, " lon: %.5f ", gpx->lon);
+            fprintf(stdout, " alt: %.2f ", gpx->alt);
+            if (!err2) {
+                //if (gpx->option.vbs == 2) fprintf(stdout, "  (%.1f , %.1f : %.1f) ", gpx->vx, gpx->vy, gpx->vD2);
+                fprintf(stdout, "  vH: %.1f  D: %.1f  vV: %.1f ", gpx->vH, gpx->vD, gpx->vV);
             }
-            if (option_ptu) {
-                float t = get_Temp(csOK);
+            if (gpx->option.vbs >= 2) {
+                get_SN(gpx);
+                fprintf(stdout, "  SN: %s", gpx->SN);
+            }
+            if (gpx->option.vbs >= 2) {
+                fprintf(stdout, "  # ");
+                if (csOK) fprintf(stdout, " [OK]"); else fprintf(stdout, " [NO]");
+            }
+            if (gpx->option.ptu) {
+                float t = get_Temp(gpx, csOK);
                 if (t > -270.0) fprintf(stdout, "  T=%.1fC ", t);
-                if (option_verbose >= 3) {
-                    float t2 = get_Tntc2(csOK);
-                    float fq555 = get_TLC555freq();
+                if (gpx->option.vbs >= 3) {
+                    float t2 = get_Tntc2(gpx, csOK);
+                    float fq555 = get_TLC555freq(gpx);
                     if (t2 > -270.0) fprintf(stdout, " (T2:%.1fC) (%.3fkHz) ", t2, fq555/1e3);
                 }
             }
         }
         fprintf(stdout, "\n");
 
+
+        if (gpx->option.jsn) {
+            // Print out telemetry data as JSON
+            if (csOK) {
+                int j;
+                char sn_id[4+12] = "M10-";
+                // UTC = GPS - UTC_OFS  (ab 1.1.2017: UTC_OFS=18sec)
+                int utc_s = gpx->gpssec - gpx->utc_ofs;
+                int utc_week = gpx->week;
+                int utc_jahr; int utc_monat; int utc_tag;
+                int utc_std; int utc_min; float utc_sek;
+                if (utc_s < 0) {
+                    utc_week -= 1;
+                    utc_s += 604800; // 604800sec = 1week
+                }
+                Gps2Date(utc_week, utc_s, &utc_jahr, &utc_monat, &utc_tag);
+                utc_s  %= (24*3600); // 86400sec = 1day
+                utc_std =  utc_s/3600;
+                utc_min = (utc_s%3600)/60;
+                utc_sek =  utc_s%60 + (gpx->tow_ms % 1000)/1000.0;
+
+                strncpy(sn_id+4, gpx->SN, 12);
+                sn_id[15] = '\0';
+                for (j = 0; sn_id[j]; j++) { if (sn_id[j] == ' ') sn_id[j] = '-'; }
+
+                fprintf(stdout, "{ \"id\": \"%s\", \"datetime\": \"%04d-%02d-%02dT%02d:%02d:%06.3fZ\", \"lat\": %.5f, \"lon\": %.5f, \"alt\": %.5f, \"vel_h\": %.5f, \"heading\": %.5f, \"vel_v\": %.5f, \"sats\": %d",
+                               sn_id, utc_jahr, utc_monat, utc_tag, utc_std, utc_min, utc_sek, gpx->lat, gpx->lon, gpx->alt, gpx->vH, gpx->vD, gpx->vV, gpx->numSV);
+                if (gpx->option.ptu) {
+                    float t = get_Temp(gpx, 0);
+                    if (t > -273.0) fprintf(stdout, ", \"temp\": %.1f", t);
+                }
+                fprintf(stdout, " }\n");
+                fprintf(stdout, "\n");
+            }
+        }
+
     }
 
     return err;
 }
 
-int print_frame(int pos) {
+static int print_frame(gpx_t *gpx, int pos) {
     int i;
     ui8_t byte;
     int cs1, cs2;
     int flen = stdFLEN; // stdFLEN=0x64, auxFLEN=0x76
 
-    bits2bytes(frame_bits, frame_bytes);
-    flen = frame_bytes[0];
-    if (flen == stdFLEN) auxlen = 0;
+    bits2bytes(gpx->frame_bits, gpx->frame_bytes);
+    flen = gpx->frame_bytes[0];
+    if (flen == stdFLEN) gpx->auxlen = 0;
     else {
-        auxlen = flen - stdFLEN;
-        if (auxlen < 0 || auxlen > AUX_LEN) auxlen = 0;
+        gpx->auxlen = flen - stdFLEN;
+        if (gpx->auxlen < 0 || gpx->auxlen > AUX_LEN) gpx->auxlen = 0;
     }
 
-    cs1 = (frame_bytes[pos_Check+auxlen] << 8) | frame_bytes[pos_Check+auxlen+1];
-    cs2 = checkM10(frame_bytes, pos_Check+auxlen);
+    cs1 = (gpx->frame_bytes[pos_Check+gpx->auxlen] << 8) | gpx->frame_bytes[pos_Check+gpx->auxlen+1];
+    cs2 = checkM10(gpx->frame_bytes, pos_Check+gpx->auxlen);
 
-    if (option_raw) {
+    if (gpx->option.raw) {
 
-        if (option_color  &&  frame_bytes[1] != 0x49) {
+        if (gpx->option.col  &&  gpx->frame_bytes[1] != 0x49) {
             fprintf(stdout, col_FRTXT);
-            for (i = 0; i < FRAME_LEN+auxlen; i++) {
-                byte = frame_bytes[i];
+            for (i = 0; i < FRAME_LEN+gpx->auxlen; i++) {
+                byte = gpx->frame_bytes[i];
                 if ((i >= pos_GPSTOW)   &&  (i < pos_GPSTOW+4))   fprintf(stdout, col_GPSTOW);
                 if ((i >= pos_GPSlat)   &&  (i < pos_GPSlat+4))   fprintf(stdout, col_GPSlat);
                 if ((i >= pos_GPSlon)   &&  (i < pos_GPSlon+4))   fprintf(stdout, col_GPSlon);
@@ -740,11 +825,11 @@ int print_frame(int pos) {
                 if ((i >= pos_GPSweek)  &&  (i < pos_GPSweek+2))  fprintf(stdout, col_GPSweek);
                 if ((i >= pos_GPSvE)    &&  (i < pos_GPSvE+6))    fprintf(stdout, col_GPSvel);
                 if ((i >= pos_SN)       &&  (i < pos_SN+5))       fprintf(stdout, col_SN);
-                if ((i >= pos_Check+auxlen)  &&  (i < pos_Check+auxlen+2))  fprintf(stdout, col_Check);
+                if ((i >= pos_Check+gpx->auxlen)  &&  (i < pos_Check+gpx->auxlen+2))  fprintf(stdout, col_Check);
                 fprintf(stdout, "%02x", byte);
                 fprintf(stdout, col_FRTXT);
             }
-            if (option_verbose) {
+            if (gpx->option.vbs) {
                 fprintf(stdout, " # "col_Check"%04x"col_FRTXT, cs2);
                 if (cs1 == cs2) fprintf(stdout, " "col_CSok"[OK]"col_TXT);
                 else            fprintf(stdout, " "col_CSno"[NO]"col_TXT);
@@ -752,11 +837,11 @@ int print_frame(int pos) {
             fprintf(stdout, ANSI_COLOR_RESET"\n");
         }
         else {
-            for (i = 0; i < FRAME_LEN+auxlen; i++) {
-                byte = frame_bytes[i];
+            for (i = 0; i < FRAME_LEN+gpx->auxlen; i++) {
+                byte = gpx->frame_bytes[i];
                 fprintf(stdout, "%02x", byte);
             }
-            if (option_verbose) {
+            if (gpx->option.vbs) {
                 fprintf(stdout, " # %04x", cs2);
                 if (cs1 == cs2) fprintf(stdout, " [OK]"); else fprintf(stdout, " [NO]");
             }
@@ -764,53 +849,67 @@ int print_frame(int pos) {
         }
 
     }
-    else if (frame_bytes[1] == 0x49) {
-        if (option_verbose == 3) {
-            for (i = 0; i < FRAME_LEN+auxlen; i++) {
-                byte = frame_bytes[i];
+    else if (gpx->frame_bytes[1] == 0x49) {
+        if (gpx->option.vbs == 3) {
+            for (i = 0; i < FRAME_LEN+gpx->auxlen; i++) {
+                byte = gpx->frame_bytes[i];
                 fprintf(stdout, "%02x", byte);
             }
             fprintf(stdout, "\n");
         }
     }
-    else print_pos(cs1 == cs2);
+    else print_pos(gpx, cs1 == cs2);
 
-    return (frame_bytes[0]<<8)|frame_bytes[1];
+    return (gpx->frame_bytes[0]<<8)|gpx->frame_bytes[1];
 }
 
 
 int main(int argc, char **argv) {
 
+    int option_verbose = 0;  // ausfuehrliche Anzeige
+    int option_raw = 0;      // rohe Frames
+    int option_inv = 0;      // invertiert Signal
+    //int option_res = 0;      // genauere Bitmessung
+    int option_color = 0;
+    int option_ptu = 0;
+    int option_dc = 0;
+    int option_iq = 0;
+    int wavloaded = 0;
+    int sel_wavch = 0;     // audio channel: left
     int spike = 0;
 
     FILE *fp = NULL;
     char *fpname = NULL;
-    float spb = 0.0;
-    int header_found = 0;
+
+    int k;
 
     int bit, bit0;
     int bitpos = 0;
     int bitQ;
     int pos;
-    int herrs, herr1;
-    int headerlen = 0;
 
-    int k, K;
-    float mv;
-    unsigned int mv_pos, mv0_pos;
-    int mp = 0;
+    //int headerlen = 0;
+
+    int header_found = 0;
 
     float thres = 0.76;
+    float _mv = 0.0;
 
     int symlen = 2;
     int bitofs = 0; // 0 .. +2
     int shift = 0;
+
+    pcm_t pcm = {0};
+    dsp_t dsp = {0};  //memset(&dsp, 0, sizeof(dsp));
+
+    gpx_t gpx = {0};
 
 
 #ifdef CYGWIN
     _setmode(fileno(stdin), _O_BINARY);  // _setmode(_fileno(stdin), _O_BINARY);
 #endif
     setbuf(stdout, NULL);
+
 
     fpname = argv[0];
     ++argv;
@@ -837,7 +936,7 @@ int main(int argc, char **argv) {
         else if ( (strcmp(*argv, "-c") == 0) || (strcmp(*argv, "--color") == 0) ) {
             option_color = 1;
         }
-        else if   (strcmp(*argv, "--res") == 0) { option_res = 1; }
+        //else if   (strcmp(*argv, "--res") == 0) { option_res = 1; }
         else if ( (strcmp(*argv, "--ptu") == 0) ) {
             option_ptu = 1;
         }
@@ -847,7 +946,7 @@ int main(int argc, char **argv) {
         else if ( (strcmp(*argv, "--spike") == 0) ) {
             spike = 1;
         }
-        else if ( (strcmp(*argv, "--ch2") == 0) ) { wav_channel = 1; }  // right channel (default: 0=left)
+        else if ( (strcmp(*argv, "--ch2") == 0) ) { sel_wavch = 1; }  // right channel (default: 0=left)
         else if ( (strcmp(*argv, "--ths") == 0) ) {
             ++argv;
             if (*argv) {
@@ -864,6 +963,10 @@ int main(int argc, char **argv) {
             }
             else return -1;
         }
+        else if   (strcmp(*argv, "--iq0") == 0) { option_iq = 1; }  // differential/FM-demod
+        else if   (strcmp(*argv, "--iq2") == 0) { option_iq = 2; }
+        else if   (strcmp(*argv, "--iq3") == 0) { option_iq = 3; }  // iq2==iq3
+        else if   (strcmp(*argv, "--json") == 0) { gpx.option.jsn = 1; }
         else {
             fp = fopen(*argv, "rb");
             if (fp == NULL) {
@@ -877,86 +980,107 @@ int main(int argc, char **argv) {
     if (!wavloaded) fp = stdin;
 
 
-    spb = read_wav_header(fp, (float)BAUD_RATE, wav_channel);
-    if ( spb < 0 ) {
+    gpx.option.inv = option_inv; // irrelevant
+    gpx.option.vbs = option_verbose;
+    gpx.option.raw = option_raw;
+    gpx.option.ptu = option_ptu;
+    gpx.option.col = option_color;
+
+
+    // init gpx
+    pcm.sel_ch = sel_wavch;
+    k = read_wav_header(&pcm, fp);
+    if ( k < 0 ) {
         fclose(fp);
         fprintf(stderr, "error: wav header\n");
         return -1;
     }
-    if ( spb < 8 ) {
-        fprintf(stderr, "note: sample rate low\n");
+
+    // m10: BT>1?, h=1.2 ?
+    symlen = 2;
+
+    // init dsp
+    //
+    dsp.fp = fp;
+    dsp.sr = pcm.sr;
+    dsp.bps = pcm.bps;
+    dsp.nch = pcm.nch;
+    dsp.ch = pcm.sel_ch;
+    dsp.br = (float)BAUD_RATE;
+    dsp.sps = (float)dsp.sr/dsp.br;
+    dsp.symlen = symlen;
+    dsp.symhd = 1; // M10!header
+    dsp._spb = dsp.sps*symlen;
+    dsp.hdr = rawheader;
+    dsp.hdrlen = strlen(rawheader);
+    dsp.BT = 1.8; // bw/time (ISI) // 1.0..2.0
+    dsp.h = 0.9;  // 1.2 modulation index
+    dsp.opt_iq = option_iq;
+
+    if ( dsp.sps < 8 ) {
+        fprintf(stderr, "note: sample rate low (%.1f sps)\n", dsp.sps);
     }
 
+    //headerlen = dsp.hdrlen;
 
-    symlen = 2;
-    bitofs += shift;
-
-    headerlen = strlen(rawheader);
-    K = init_buffers(rawheader, headerlen, 1); // shape=0 (alt. shape=1)
-    if ( K < 0 ) {
+    k = init_buffers(&dsp);
+    if ( k < 0 ) {
         fprintf(stderr, "error: init buffers\n");
         return -1;
     };
 
 
-    k = 0;
-    mv = 0;
-    mv_pos = 0;
+    bitofs += shift;
 
-    while ( f32buf_sample(fp, option_inv) != EOF ) {
+        while ( 1 )
+        {
 
-        k += 1;
-        if (k >= K-4) {
-            mv0_pos = mv_pos;
-            mp = getCorrDFT(K, 0, &mv, &mv_pos);
-            k = 0;
-        }
-        else {
-            mv = 0.0;
-            continue;
-        }
+                header_found = find_header(&dsp, thres, 2, bitofs, option_dc);
+                _mv = dsp.mv;
 
-        if (mp > 0 && (mv > thres || mv < -thres)) {
-            if (mv_pos > mv0_pos) {
+            if (header_found == EOF) break;
 
-                header_found = 0;
-                herrs = headcmp(1, rawheader, headerlen, mv_pos, mv<0, option_dc); // header nicht manchester!
-                herr1 = 0;
-                if (herrs <= 3 && herrs > 0) {
-                    herr1 = headcmp(1, rawheader, headerlen, mv_pos+1, mv<0, 0); // nur 1x dc
-                    //int herr2 = headcmp(1, rawheader, headerlen, mv_pos-1, mv<0, 0);
-                    if (herr1 < herrs) {
-                        herrs = herr1;
-                        herr1 = 1;
-                    }
-                }
-                if (herrs <= 1) header_found = 1; // herrs <= 1 bitfehler in header
+            // mv == correlation score
+            if (_mv*(0.5-gpx.option.inv) < 0) {
+                gpx.option.inv ^= 0x1;  // M10: irrelevant
+            }
+
 
                 if (header_found) {
 
                     bitpos = 0;
                     pos = 0;
                     pos /= 2;
-                    bit0 = '0'; // oder: mv[j] > 0
+                    bit0 = '0'; // oder: _mv[j] > 0
 
                     while ( pos < BITFRAME_LEN+BITAUX_LEN ) {
-                        bitQ = read_spkbit(fp, symlen, &bit, option_inv, bitofs, bitpos==0, spike); // symlen=2
-                        if (bitQ == EOF) { break; }
-                        frame_bits[pos] = 0x31 ^ (bit0 ^ bit);
+
+                        if (option_iq >= 2) {
+                            float bl = -1;
+                            if (option_iq > 2) bl = 4.0;
+                            bitQ = read_slbit(&dsp, &bit, 0/*gpx.option.inv*/, bitofs, bitpos, bl, 0);
+                        }
+                        else {
+                            bitQ = read_slbit(&dsp, &bit, 0/*gpx.option.inv*/, bitofs, bitpos, -1, spike); // symlen=2
+                        }
+
+                        if ( bitQ == EOF ) { break; }
+
+                        gpx.frame_bits[pos] = 0x31 ^ (bit0 ^ bit);
                         pos++;
                         bit0 = bit;
                         bitpos += 1;
                     }
-                    frame_bits[pos] = '\0';
-                    print_frame(pos);
+                    gpx.frame_bits[pos] = '\0';
+                    print_frame(&gpx, pos);
                     if (pos < BITFRAME_LEN) break;
 
                     header_found = 0;
 
                     // bis Ende der Sekunde vorspulen; allerdings Doppel-Frame alle 10 sek
-                    if (option_verbose < 3) { // && (regulare frame) // print_frame-return?
+                    if (gpx.option.vbs < 3) { // && (regulare frame) // print_frame-return?
                         while ( bitpos < 5*BITFRAME_LEN ) {
-                            bitQ = read_spkbit(fp, symlen, &bit, option_inv, bitofs, bitpos==0, spike); // symlen=2
+                            bitQ = read_slbit(&dsp, &bit, 0/*gpx.option.inv*/, bitofs, bitpos, -1, spike); // symlen=2
                             if ( bitQ == EOF) break;
                             bitpos++;
                         }
@@ -964,13 +1088,10 @@ int main(int argc, char **argv) {
 
                     pos = 0;
                 }
-            }
         }
 
-    }
 
-
-    free_buffers();
+    free_buffers(&dsp);
 
     fclose(fp);
 

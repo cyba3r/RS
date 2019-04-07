@@ -18,6 +18,7 @@
 typedef unsigned char  ui8_t;
 typedef unsigned short ui16_t;
 typedef unsigned int   ui32_t;
+typedef          int    i32_t;
 
 typedef struct {
     int week; int gpssec;
@@ -40,6 +41,7 @@ int option_verbose = 0,  // ausfuehrliche Anzeige
     option_b = 0,
     option_color = 0,
     option_ptu = 0,
+    option_sat = 0,
     wavloaded = 0;
 int wav_channel = 0;     // audio channel: left
 
@@ -313,9 +315,9 @@ dduudduudduudduu duduudduuduudduu  ddududuudduduudd uduuddududududud uudduduuddu
 #define HEADLEN 32  // HEADLEN+HEADOFS=32 <= strlen(header)
 #define HEADOFS  0
                  // Sync-Header (raw)               // Sonde-Header (bits)
-//char head[] = "11001100110011001010011001001100"; //"011001001001111100100000"; // M10: 64 9F 20 , M2K2: 64 8F 20
-                                                    //"011101101001111100100000"; // M10: 76 9F 20 , aux-data?
-                                                    //"011001000100100100001001"; // M10-dop: 64 49 09
+//char head[] = "11001100110011001010011001001100"; //"011001001001111100100000"; // M10: 64 9F , M2K2: 64 8F
+                                                    //"011101101001111100100000"; // M10: 76 9F , aux-data?
+                                                    //"011001000100100100001001"; // M10-dop: 64 49
 char header[] =  "10011001100110010100110010011001";
 
 #define FRAME_LEN       (100+1)   // 0x64+1
@@ -472,7 +474,55 @@ int dpsk_bpm(char* frame_rawbits, char *frame_bits, int len) {
     return bit0;
 }
 
-/* -------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/*
+M10 w/ trimble GPS
+
+frame[0x0] = framelen
+frame[0x1] = 0x9F (type M10)
+
+init/noGPS: frame[0x2]=0x23
+GPS: frame[0x2]=0x20 (GPS trimble pck 0x8F-20 sub-id)
+
+frame[0x02..0x21] = GPS trimble pck 0x8F-20 byte 0..31 (sub-id, vel, tow, lat, lon, alt, fix, NumSV, UTC-ofs, week)
+frame[0x22..0x2D] = GPS trimble pck 0x8F-20 byte 32..55:2 (PRN 1..12 only)
+
+Trimble Copernicus II
+GPS packet 0x8F-20 (p.138)
+byte
+0      sub-pck id (always 0x20)
+2-3    velE (i16) 0.005m/s
+4-5    velN (i16) 0.005m/s
+6-7    velU (i16) 0.005m/s
+8-11   TOW (ms)
+12-15  lat (scale 2^32/360) (i32) -90..90
+16-19  lon (scale 2^32/360) (ui32) 0..360 <-> (i32) -180..180
+20-23  alt (i32) mm above ellipsoid)
+24     bit0: vel-scale (0: 0.005m/s)
+26     datum (1: WGS-84)
+27     fix: bit0(0:valid fix, 1:invalid fix), bit2(0:3D, 1:2D)
+28     numSVs
+29     UTC offset = (GPS - UTC) sec
+30-31  GPS week
+32+2*n PRN_(n+1), bit0-5
+
+frame[0x32..0x5C] sensors (rel.hum., temp.)
+frame[0x5D..0x61] SN
+frame[0x62] counter
+frame[0x63..0x64] check  (AUX len=0x76: frame[0x63..0x74], frame[0x75..0x76])
+
+
+6449/10sec-frame:
+GPS trimble pck 0x47 (signal levels): numSats sat1 lev1 sat2 lev2 ..
+frame[0x0] = framelen
+frame[0x1] = 0x49
+frame[0x2] = numSats (max 12)
+frame[0x3+2*n] = PRN_(n+1)
+frame[0x4+2*n] = signal level (float32 -> i8-byte level)
+
+*/
+
 
 #define stdFLEN        0x64  // pos[0]=0x64
 #define pos_GPSTOW     0x0A  // 4 byte
@@ -577,7 +627,7 @@ int get_GPSlat() {
     int i;
     unsigned byte;
     ui8_t gpslat_bytes[4];
-    int gpslat;
+    i32_t gpslat;
     double lat;
 
     for (i = 0; i < 4; i++) {
@@ -599,7 +649,7 @@ int get_GPSlon() {
     int i;
     unsigned byte;
     ui8_t gpslon_bytes[4];
-    int gpslon;
+    i32_t gpslon;  // (ui32) 0..360 <-> (i32) -180..180
     double lon;
 
     for (i = 0; i < 4; i++) {
@@ -621,7 +671,7 @@ int get_GPSalt() {
     int i;
     unsigned byte;
     ui8_t gpsalt_bytes[4];
-    int gpsalt;
+    i32_t gpsalt;
     double alt;
 
     for (i = 0; i < 4; i++) {
@@ -643,23 +693,23 @@ int get_GPSvel() {
     int i;
     unsigned byte;
     ui8_t gpsVel_bytes[2];
-    short vel16;
+    short vel16; // i16_t
     double vx, vy, dir, alpha;
-    const double ms2kn100 = 2e2;  // m/s -> knots: 1 m/s = 3.6/1.852 kn = 1.94 kn
+    const double sc5 = 2e2;  // scale 0.005m/s
 
     for (i = 0; i < 2; i++) {
         byte = frame_bytes[pos_GPSvE + i];
         gpsVel_bytes[i] = byte;
     }
     vel16 = gpsVel_bytes[0] << 8 | gpsVel_bytes[1];
-    vx = vel16 / ms2kn100; // ost
+    vx = vel16 / sc5; // ost
 
     for (i = 0; i < 2; i++) {
         byte = frame_bytes[pos_GPSvN + i];
         gpsVel_bytes[i] = byte;
     }
     vel16 = gpsVel_bytes[0] << 8 | gpsVel_bytes[1];
-    vy= vel16 / ms2kn100; // nord
+    vy= vel16 / sc5; // nord
 
     datum.vx = vx;
     datum.vy = vy;
@@ -679,7 +729,7 @@ int get_GPSvel() {
         gpsVel_bytes[i] = byte;
     }
     vel16 = gpsVel_bytes[0] << 8 | gpsVel_bytes[1];
-    datum.vV = vel16 / ms2kn100;
+    datum.vV = vel16 / sc5;
 
     return 0;
 }
@@ -767,7 +817,9 @@ int checkM10(ui8_t *msg, int len) {
 
 /* -------------------------------------------------------------------------- */
 
-// Temperatur Sensor
+// https://www.gruan.org/gruan/editor/documents/meetings/icm-6/pres/pres_306_Haeffelin.pdf
+//
+// Temperature Sensor
 // NTC-Thermistor Shibaura PB5-41E
 //
 float get_Temp(int csOK) {
@@ -916,33 +968,63 @@ float get_Tntc2(int csOK) {
 #define LN2         0.693147181
 #define ADR_108A    1000.0       // 0x3E8=1000
 
+float get_count_55() { // CalRef 55%RH , T=20C ?
+    ui32_t TBCREF_1000 = frame_bytes[0x32] | (frame_bytes[0x33]<<8) | (frame_bytes[0x34]<<16);
+    return TBCREF_1000 / ADR_108A;
+}
 float get_count_RH() {  // capture 1000 rising edges
     ui32_t TBCCR1_1000 = frame_bytes[0x35] | (frame_bytes[0x36]<<8) | (frame_bytes[0x37]<<16);
     return TBCCR1_1000 / ADR_108A;
 }
-float get_TLC555freq() {
-    return FREQ_CAPCLK / get_count_RH();
+float get_TLC555freq(float count) {
+    return FREQ_CAPCLK / count;
 }
-/*
-double get_C_RH() {  // TLC555 astable: R_A=3.65k, R_B=338k
-    double R_B = 338e3;
-    double R_A = 3.65e3;
-    double C_RH = 1/get_TLC555freq() / (LN2 * (R_A + 2*R_B));
+
+float get_C_RH(float freq, float T) {  // TLC555 astable: R_A=3.65k, R_B=338k
+    float R_B = 338e3;
+    float R_A = 3.65e3;
+    float td = 0;
+    float C_RH = (1/freq - 2*td) / (LN2 * (R_A + 2*R_B));
+    // freq/T compensation ...
     return C_RH;
 }
-double get_RH(int csOK) {
+
+float cRHc55_RH(float cRHc55) {  // C_RH / C_55
 // U.P.S.I.
 // C_RH/C_55 = 0.8955 + 0.002*RH , T=20C
 // C_RH = C_RH(RH,T) , RH = RH(C_RH,T)
 // C_RH/C_55 approx.eq. count_RH/count_ref
-// c55=270pF? diff=C_55-c55, T=20C
-    ui32_t c = frame_bytes[0x32] | (frame_bytes[0x33]<<8) | (frame_bytes[0x34]<<16); // CalRef 55%RH , T=20C ?
-    double count_ref = c / ADR_108A; // CalRef 55%RH , T=20C ?
-    double C_RH = get_C_RH();
-    double T = get_Tntc2(csOK);
-    return 0;
+    float TH = get_Tntc2(0);
+    float Tc = get_Temp(0);
+    float rh = (cRHc55-0.8955)/0.002; // UPSI linear transfer function
+    // temperature compensation
+    float T0 = 0.0, T1 = -30.0; // T/C
+    float T = Tc; // TH, TH-Tc (sensorT - T)
+    if (T < T0) rh += T0 - T/5.5;        // approx/empirical
+    if (T < T1) rh *= 1.0 + (T1-T)/75.0; // approx/empirical
+    if (rh < 0.0) rh = 0.0;
+    if (rh > 100.0) rh = 100.0;
+    return rh;
 }
-*/
+
+float get_RHc(int csOK) { // experimental/raw, errors~10%
+    float Tc = get_Temp(0);
+    float count_ref = get_count_55(); // CalRef 55%RH , T=20C ?
+    float count_RH = get_count_RH();
+    float C_55 = get_C_RH(get_TLC555freq(count_ref), 20.0); // CalRef 55%RH , T=20C ?
+    float C_RH = get_C_RH(get_TLC555freq(count_RH), Tc); // Tc == T_555 ?
+    float  cRHc55 = C_RH / C_55;
+    return cRHc55_RH(cRHc55);
+}
+
+float get_RH(int csOK) { // experimental/raw, errors~10%
+    //ui32_t TBCREF_1000 = frame_bytes[0x32] | (frame_bytes[0x33]<<8) | (frame_bytes[0x34]<<16); // CalRef 55%RH , T=20C ?
+    //ui32_t TBCCR1_1000 = frame_bytes[0x35] | (frame_bytes[0x36]<<8) | (frame_bytes[0x37]<<16); // FrqCnt TLC555
+    //float  cRHc55 = TBCCR1_1000 / (float)TBCREF_1000; // CalRef 55%RH , T=20C ?
+    float  cRHc55 = get_count_RH() / get_count_55(); // CalRef 55%RH , T=20C ?
+    return cRHc55_RH(cRHc55);
+}
+
 /* -------------------------------------------------------------------------- */
 
 int print_pos(int csOK) {
@@ -972,7 +1054,7 @@ int print_pos(int csOK) {
                 err |= get_GPSvel();
                 if (!err) {
                     //if (option_verbose == 2) fprintf(stdout, "  "col_GPSvel"(%.1f , %.1f : %.1f)"col_TXT" ", datum.vx, datum.vy, datum.vD2);
-                    fprintf(stdout, "  vH: "col_GPSvel"%.1f"col_TXT"  D: "col_GPSvel"%.1f"col_TXT"°  vV: "col_GPSvel"%.1f"col_TXT" ", datum.vH, datum.vD, datum.vV);
+                    fprintf(stdout, "  vH: "col_GPSvel"%.1f"col_TXT"  D: "col_GPSvel"%.1f"col_TXT"  vV: "col_GPSvel"%.1f"col_TXT" ", datum.vH, datum.vD, datum.vV);
                 }
                 if (option_verbose >= 2) {
                     get_SN();
@@ -986,11 +1068,15 @@ int print_pos(int csOK) {
             }
             if (option_ptu) {
                 float t = get_Temp(csOK);
-                if (t > -270.0) fprintf(stdout, "  T=%.1fC ", t);
+                float rh = get_RH(csOK);
+                fprintf(stdout, "  ");
+                if (t > -270.0) fprintf(stdout, "T=%.1fC ", t);
+                if (option_verbose >= 3) { if (rh > -0.5) fprintf(stdout, "_RH=%.0f%% ", rh); }
                 if (option_verbose >= 3) {
                     float t2 = get_Tntc2(csOK);
-                    float fq555 = get_TLC555freq();
+                    float fq555 = get_TLC555freq(get_count_RH());
                     if (t2 > -270.0) fprintf(stdout, " (T2:%.1fC) (%.3fkHz) ", t2, fq555/1e3);
+                    fprintf(stdout, "(cRH=%.1f%%) ", get_RHc(csOK));
                 }
             }
             fprintf(stdout, ANSI_COLOR_RESET"");
@@ -1006,8 +1092,8 @@ int print_pos(int csOK) {
             if (option_verbose) {
                 err |= get_GPSvel();
                 if (!err) {
-                    //if (option_verbose == 2) fprintf(stdout, "  (%.1f , %.1f : %.1f°) ", datum.vx, datum.vy, datum.vD2);
-                    fprintf(stdout, "  vH: %.1f  D: %.1f°  vV: %.1f ", datum.vH, datum.vD, datum.vV);
+                    //if (option_verbose == 2) fprintf(stdout, "  (%.1f , %.1f : %.1f) ", datum.vx, datum.vy, datum.vD2);
+                    fprintf(stdout, "  vH: %.1f  D: %.1f  vV: %.1f ", datum.vH, datum.vD, datum.vV);
                 }
                 if (option_verbose >= 2) {
                     get_SN();
@@ -1020,15 +1106,29 @@ int print_pos(int csOK) {
             }
             if (option_ptu) {
                 float t = get_Temp(csOK);
-                if (t > -270.0) fprintf(stdout, "  T=%.1fC ", t);
+                float rh = get_RH(csOK);
+                fprintf(stdout, "  ");
+                if (t > -270.0) fprintf(stdout, "T=%.1fC ", t);
+                if (option_verbose >= 3) { if (rh > -0.5) fprintf(stdout, "_RH=%.0f%% ", rh); }
                 if (option_verbose >= 3) {
                     float t2 = get_Tntc2(csOK);
-                    float fq555 = get_TLC555freq();
+                    float fq555 = get_TLC555freq(get_count_RH());
                     if (t2 > -270.0) fprintf(stdout, " (T2:%.1fC) (%.3fkHz) ", t2, fq555/1e3);
+                    fprintf(stdout, "(cRH=%.1f%%) ", get_RHc(csOK));
                 }
             }
         }
         fprintf(stdout, "\n");
+
+        if (csOK && option_sat) {
+            int i;
+            fprintf(stdout, " %2d", frame_bytes[pos_GPSweek-2]); // GPS-sats
+            fprintf(stdout, " : ");
+            for (i = 0; i < frame_bytes[pos_GPSweek-2]; i++) {   // PRN
+                fprintf(stdout, " %2d", frame_bytes[pos_GPSweek+2+i]&0x3F);
+            }
+            fprintf(stdout, "\n");
+        }
 
     }
 
@@ -1155,6 +1255,9 @@ int main(int argc, char **argv) {
         else if   (strcmp(*argv, "-b2") == 0) { option_b = 2; }
         else if ( (strcmp(*argv, "--ptu") == 0) ) {
             option_ptu = 1;
+        }
+        else if ( (strcmp(*argv, "--sat") == 0) ) {
+            option_sat = 1;
         }
         else if   (strcmp(*argv, "--ch2") == 0) { wav_channel = 1; }  // right channel (default: 0=left)
         else {
